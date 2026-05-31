@@ -8,11 +8,13 @@ loadEnvFile(path.join(__dirname, ".env"));
 const NODE_ENV = process.env.NODE_ENV || "development";
 const IS_PRODUCTION = NODE_ENV === "production";
 const PORT = parsePort(process.env.PORT, 4173);
-const WEBHOOK_TOKEN = process.env.GITLAB_WEBHOOK_TOKEN || "";
-const GITLAB_BASE_URL = (process.env.GITLAB_BASE_URL || "https://gitlab.com").replace(/\/$/, "");
-const GITLAB_TOKEN = process.env.GITLAB_TOKEN || "";
-const GITLAB_PROJECT_ID = process.env.GITLAB_PROJECT_ID || "";
-const USE_GITLAB = Boolean(GITLAB_TOKEN && GITLAB_PROJECT_ID);
+const runtimeConfig = {
+  webhookToken: process.env.GITLAB_WEBHOOK_TOKEN || "",
+  gitlabBaseUrl: normalizeGitLabBaseUrl(process.env.GITLAB_BASE_URL || "https://gitlab.com"),
+  gitlabToken: process.env.GITLAB_TOKEN || "",
+  gitlabProjectId: process.env.GITLAB_PROJECT_ID || "",
+  source: process.env.GITLAB_TOKEN && process.env.GITLAB_PROJECT_ID ? "env" : "mock"
+};
 const API_RATE_LIMIT_PER_MINUTE = parsePositiveInt(process.env.API_RATE_LIMIT_PER_MINUTE, 120);
 const BODY_LIMIT_BYTES = parsePositiveInt(process.env.BODY_LIMIT_BYTES, 1_000_000);
 const REQUEST_TIMEOUT_MS = parsePositiveInt(process.env.REQUEST_TIMEOUT_MS, 30_000);
@@ -54,12 +56,36 @@ function parsePositiveInt(value, fallback) {
   return parsed;
 }
 
+function normalizeGitLabBaseUrl(value) {
+  const baseUrl = String(value || "https://gitlab.com").trim().replace(/\/+$/, "");
+  const parsed = new URL(baseUrl);
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    throw new Error("GitLab base URL must use http or https.");
+  }
+  return parsed.origin + parsed.pathname.replace(/\/+$/, "");
+}
+
+function isGitLabConfigured() {
+  return Boolean(runtimeConfig.gitlabToken && runtimeConfig.gitlabProjectId);
+}
+
+function publicSetup() {
+  return {
+    configured: isGitLabConfigured(),
+    source: runtimeConfig.source,
+    baseUrl: runtimeConfig.gitlabBaseUrl,
+    projectId: runtimeConfig.gitlabProjectId || "",
+    tokenConfigured: Boolean(runtimeConfig.gitlabToken),
+    webhookTokenConfigured: Boolean(runtimeConfig.webhookToken)
+  };
+}
+
 function validateConfig() {
-  if (IS_PRODUCTION && !WEBHOOK_TOKEN) {
+  if (IS_PRODUCTION && !runtimeConfig.webhookToken) {
     console.warn("Production warning: GITLAB_WEBHOOK_TOKEN is not set; webhook endpoint will reject requests.");
   }
 
-  if (IS_PRODUCTION && Boolean(GITLAB_TOKEN) !== Boolean(GITLAB_PROJECT_ID)) {
+  if (IS_PRODUCTION && Boolean(runtimeConfig.gitlabToken) !== Boolean(runtimeConfig.gitlabProjectId)) {
     throw new Error("Set both GITLAB_TOKEN and GITLAB_PROJECT_ID, or neither, in production.");
   }
 }
@@ -238,7 +264,7 @@ const investigations = new Map();
 const auditLog = [];
 
 function gitlabUrl(pathname, params = {}) {
-  const url = new URL(`${GITLAB_BASE_URL}/api/v4${pathname}`);
+  const url = new URL(`${runtimeConfig.gitlabBaseUrl}/api/v4${pathname}`);
   Object.entries(params).forEach(([key, value]) => {
     if (value === undefined || value === null || value === "") return;
     if (Array.isArray(value)) {
@@ -251,14 +277,14 @@ function gitlabUrl(pathname, params = {}) {
 }
 
 async function gitlabFetch(pathname, params = {}, options = {}) {
-  if (!USE_GITLAB) {
+  if (!isGitLabConfigured()) {
     throw new Error("GitLab is not configured. Set GITLAB_TOKEN and GITLAB_PROJECT_ID.");
   }
 
   const response = await fetch(gitlabUrl(pathname, params), {
     ...options,
     headers: {
-      "PRIVATE-TOKEN": GITLAB_TOKEN,
+      "PRIVATE-TOKEN": runtimeConfig.gitlabToken,
       "User-Agent": "devops-medic/0.1",
       ...(options.headers || {})
     }
@@ -275,7 +301,7 @@ async function gitlabFetch(pathname, params = {}, options = {}) {
 }
 
 function projectPath(pathname) {
-  return `/projects/${encodeURIComponent(GITLAB_PROJECT_ID)}${pathname}`;
+  return `/projects/${encodeURIComponent(runtimeConfig.gitlabProjectId)}${pathname}`;
 }
 
 function shortTimeAgo(isoDate) {
@@ -437,7 +463,7 @@ async function buildGitLabInvestigation(pipelineId) {
       maxPatchBytes: 12000
     },
     gitlab: {
-      projectId: GITLAB_PROJECT_ID,
+      projectId: runtimeConfig.gitlabProjectId,
       pipelineUrl: pipeline.web_url,
       jobUrl: job.web_url,
       mergeRequestUrl: mergeRequest?.web_url || ""
@@ -595,11 +621,11 @@ function buildInvestigation(pipeline) {
 }
 
 function verifyWebhook(req) {
-  if (IS_PRODUCTION && !WEBHOOK_TOKEN) return false;
-  if (!WEBHOOK_TOKEN) return true;
+  if (IS_PRODUCTION && !runtimeConfig.webhookToken) return false;
+  if (!runtimeConfig.webhookToken) return true;
   const provided = req.headers["x-gitlab-token"] || "";
   const providedBuffer = Buffer.from(provided);
-  const expectedBuffer = Buffer.from(WEBHOOK_TOKEN);
+  const expectedBuffer = Buffer.from(runtimeConfig.webhookToken);
   if (providedBuffer.length !== expectedBuffer.length) return false;
   return crypto.timingSafeEqual(providedBuffer, expectedBuffer);
 }
@@ -678,17 +704,52 @@ function routeStatic(req, res) {
 async function routeApi(req, res) {
   const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
 
+  if (req.method === "GET" && url.pathname === "/api/setup") {
+    writeJson(res, 200, { setup: publicSetup() });
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/setup") {
+    const payload = await readJson(req);
+    const baseUrl = normalizeGitLabBaseUrl(payload.baseUrl || "https://gitlab.com");
+    const projectId = String(payload.projectId || "").trim();
+    const token = String(payload.token || "").trim();
+    const webhookToken = String(payload.webhookToken || "").trim();
+
+    if (!projectId || !token) {
+      runtimeConfig.gitlabBaseUrl = baseUrl;
+      runtimeConfig.gitlabProjectId = "";
+      runtimeConfig.gitlabToken = "";
+      runtimeConfig.webhookToken = webhookToken;
+      runtimeConfig.source = "mock";
+      investigations.clear();
+      audit("setup.mock_mode", { baseUrl });
+      writeJson(res, 200, { setup: publicSetup(), message: "Mock mode enabled." });
+      return;
+    }
+
+    runtimeConfig.gitlabBaseUrl = baseUrl;
+    runtimeConfig.gitlabProjectId = projectId;
+    runtimeConfig.gitlabToken = token;
+    runtimeConfig.webhookToken = webhookToken;
+    runtimeConfig.source = "session";
+    investigations.clear();
+    audit("setup.gitlab_configured", { baseUrl, projectId });
+    writeJson(res, 200, { setup: publicSetup(), message: "GitLab connection saved for this server session." });
+    return;
+  }
+
   if (req.method === "GET" && url.pathname === "/api/health") {
     writeJson(res, 200, {
       ok: true,
       env: NODE_ENV,
       uptimeSeconds: Math.round(process.uptime()),
-      mode: USE_GITLAB ? "gitlab-live-readonly" : "mock-gitlab-mcp",
-      webhookVerification: WEBHOOK_TOKEN ? "enabled" : "disabled",
+      mode: isGitLabConfigured() ? "gitlab-live-readonly" : "mock-gitlab-mcp",
+      webhookVerification: runtimeConfig.webhookToken ? "enabled" : "disabled",
       gitlab: {
-        configured: USE_GITLAB,
-        baseUrl: GITLAB_BASE_URL,
-        projectId: GITLAB_PROJECT_ID || "not configured",
+        configured: isGitLabConfigured(),
+        baseUrl: runtimeConfig.gitlabBaseUrl,
+        projectId: runtimeConfig.gitlabProjectId || "not configured",
         mutationMode: "read-only until approval workflow is implemented"
       }
     });
@@ -696,7 +757,7 @@ async function routeApi(req, res) {
   }
 
   if (req.method === "GET" && url.pathname === "/api/pipelines") {
-    if (USE_GITLAB) {
+    if (isGitLabConfigured()) {
       const livePipelines = await listFailedPipelinesFromGitLab();
       writeJson(res, 200, {
         source: "gitlab",
@@ -716,7 +777,7 @@ async function routeApi(req, res) {
 
   const runMatch = url.pathname.match(/^\/api\/investigations\/([^/]+)\/run$/);
   if (req.method === "POST" && runMatch) {
-    if (USE_GITLAB) {
+    if (isGitLabConfigured()) {
       const investigation = await buildGitLabInvestigation(runMatch[1]);
       writeJson(res, 201, { investigation });
       return;

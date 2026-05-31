@@ -47,6 +47,14 @@ const openMr = document.querySelector("#openMr");
 const copyTrace = document.querySelector("#copyTrace");
 const projectValue = document.querySelector("#projectValue");
 const modeValue = document.querySelector("#modeValue");
+const setupForm = document.querySelector("#setupForm");
+const setupBaseUrl = document.querySelector("#setupBaseUrl");
+const setupProjectId = document.querySelector("#setupProjectId");
+const setupToken = document.querySelector("#setupToken");
+const setupWebhookToken = document.querySelector("#setupWebhookToken");
+const setupStatus = document.querySelector("#setupStatus");
+const saveSetup = document.querySelector("#saveSetup");
+const useMock = document.querySelector("#useMock");
 
 async function api(path, options = {}) {
   const response = await fetch(path, {
@@ -74,6 +82,19 @@ function escapeHtml(value) {
 function setAgentState(label, className = "") {
   agentState.textContent = label;
   agentState.className = `pill${className ? ` ${className}` : ""}`;
+}
+
+function setSetupStatus(label, className = "") {
+  setupStatus.textContent = label;
+  setupStatus.className = `pill${className ? ` ${className}` : ""}`;
+}
+
+function renderSetup(setup) {
+  setupBaseUrl.value = setup.baseUrl || "https://gitlab.com";
+  setupProjectId.value = setup.projectId || "";
+  setupToken.placeholder = setup.tokenConfigured ? "configured for this session" : "glpat-...";
+  setupWebhookToken.placeholder = setup.webhookTokenConfigured ? "configured for this session" : "optional";
+  setSetupStatus(setup.configured ? "connected" : "mock mode", setup.configured ? "success" : "");
 }
 
 function renderPipelines() {
@@ -259,9 +280,11 @@ async function loadPipelines() {
 
   try {
     const health = await api("/api/health");
+    const setupPayload = await api("/api/setup");
     const payload = await api("/api/pipelines");
     state.pipelines = payload.pipelines;
     state.selected = state.pipelines[0] || null;
+    renderSetup(setupPayload.setup);
     setAgentState(health.mode, health.gitlab?.configured ? "success" : "");
     projectValue.textContent = health.gitlab?.configured ? `GitLab ${health.gitlab.projectId}` : "Mock project";
     modeValue.textContent = health.gitlab?.configured ? "Live read-only" : "MR ready";
@@ -280,7 +303,48 @@ async function loadPipelines() {
   }
 }
 
+async function saveRepositorySetup(event) {
+  event.preventDefault();
+  saveSetup.disabled = true;
+  useMock.disabled = true;
+  setSetupStatus("connecting", "warning");
+  setAgentState("connecting repo", "warning");
+
+  try {
+    const payload = await api("/api/setup", {
+      method: "POST",
+      body: JSON.stringify({
+        baseUrl: setupBaseUrl.value,
+        projectId: setupProjectId.value,
+        token: setupToken.value,
+        webhookToken: setupWebhookToken.value
+      })
+    });
+    setupToken.value = "";
+    setupWebhookToken.value = "";
+    renderSetup(payload.setup);
+    state.latestInvestigation = null;
+    await loadPipelines();
+  } catch (error) {
+    setSetupStatus("setup failed", "danger");
+    setAgentState("setup failed", "danger");
+    traceOutput.textContent = error.message;
+  } finally {
+    saveSetup.disabled = false;
+    useMock.disabled = false;
+  }
+}
+
+async function enableMockMode() {
+  setupProjectId.value = "";
+  setupToken.value = "";
+  setupWebhookToken.value = "";
+  await saveRepositorySetup(new Event("submit"));
+}
+
 runMedic.addEventListener("click", runInvestigation);
+setupForm.addEventListener("submit", saveRepositorySetup);
+useMock.addEventListener("click", enableMockMode);
 
 resetDemo.addEventListener("click", () => {
   if (state.running) return;

@@ -99,6 +99,37 @@
           </div>
         </header>
 
+        <section class="setup-panel" aria-labelledby="setup-title">
+          <div class="setup-copy">
+            <p class="eyebrow">Repository setup</p>
+            <h3 id="setup-title">Connect a GitLab project</h3>
+            <p>Use a project ID or namespace path. The token stays in this server session and is not written to disk.</p>
+          </div>
+          <form class="setup-form" id="setupForm">
+            <label>
+              <span>GitLab URL</span>
+              <input id="setupBaseUrl" name="baseUrl" type="url" value="https://gitlab.com" autocomplete="url" required>
+            </label>
+            <label>
+              <span>Project ID or path</span>
+              <input id="setupProjectId" name="projectId" type="text" placeholder="group/subgroup/repo or 12345678" autocomplete="off">
+            </label>
+            <label>
+              <span>Access token</span>
+              <input id="setupToken" name="token" type="password" placeholder="glpat-..." autocomplete="off">
+            </label>
+            <label>
+              <span>Webhook secret</span>
+              <input id="setupWebhookToken" name="webhookToken" type="password" placeholder="optional" autocomplete="off">
+            </label>
+            <div class="setup-actions">
+              <button class="primary-button" id="saveSetup" type="submit">Connect repo</button>
+              <button class="secondary-button" id="useMock" type="button">Use mock data</button>
+              <span class="pill" id="setupStatus">not connected</span>
+            </div>
+          </form>
+        </section>
+
         <section class="status-strip" aria-label="Pipeline status summary">
           <article>
             <span class="status-label">Pipeline</span>

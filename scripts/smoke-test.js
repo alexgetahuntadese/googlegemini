@@ -62,6 +62,11 @@ async function main() {
     throw new Error(`Unexpected health payload: ${JSON.stringify(health)}`);
   }
 
+  const setup = await assertOk("/api/setup", "application/json").then((res) => res.json());
+  if (setup.setup.configured || setup.setup.tokenConfigured) {
+    throw new Error(`Expected mock setup payload: ${JSON.stringify(setup)}`);
+  }
+
   const pipelines = await assertOk("/api/pipelines", "application/json").then((res) => res.json());
   if (!Array.isArray(pipelines.pipelines) || pipelines.pipelines.length === 0) {
     throw new Error("Expected mock pipelines to be available.");
