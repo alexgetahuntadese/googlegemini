@@ -7,7 +7,7 @@ A production-shaped prototype for an agent that diagnoses failed GitLab pipeline
 For mock mode:
 
 ```powershell
-node server.js
+npm start
 ```
 
 Then open:
@@ -41,6 +41,27 @@ node server.js
 ```
 
 When configured, the app switches from mock mode to `gitlab-live-readonly`.
+
+## Production Runbook
+
+Set `NODE_ENV=production` and provide secrets through your platform's secret manager, not committed files. In production, the server adds security headers, rejects unverified GitLab webhooks when `GITLAB_WEBHOOK_TOKEN` is absent, limits API traffic per client, applies request/body timeouts, and shuts down gracefully on `SIGTERM`/`SIGINT`.
+
+Recommended deployment checks:
+
+```powershell
+npm run check
+npm run smoke
+```
+
+Useful runtime settings:
+
+```text
+PORT=4173
+API_RATE_LIMIT_PER_MINUTE=120
+BODY_LIMIT_BYTES=1000000
+REQUEST_TIMEOUT_MS=30000
+SHUTDOWN_GRACE_MS=10000
+```
 
 ## What Is Implemented
 

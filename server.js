@@ -5,13 +5,23 @@ const crypto = require("crypto");
 
 loadEnvFile(path.join(__dirname, ".env"));
 
-const PORT = Number(process.env.PORT || 4173);
+const NODE_ENV = process.env.NODE_ENV || "development";
+const IS_PRODUCTION = NODE_ENV === "production";
+const PORT = parsePort(process.env.PORT, 4173);
 const WEBHOOK_TOKEN = process.env.GITLAB_WEBHOOK_TOKEN || "";
 const GITLAB_BASE_URL = (process.env.GITLAB_BASE_URL || "https://gitlab.com").replace(/\/$/, "");
 const GITLAB_TOKEN = process.env.GITLAB_TOKEN || "";
 const GITLAB_PROJECT_ID = process.env.GITLAB_PROJECT_ID || "";
 const USE_GITLAB = Boolean(GITLAB_TOKEN && GITLAB_PROJECT_ID);
+const API_RATE_LIMIT_PER_MINUTE = parsePositiveInt(process.env.API_RATE_LIMIT_PER_MINUTE, 120);
+const BODY_LIMIT_BYTES = parsePositiveInt(process.env.BODY_LIMIT_BYTES, 1_000_000);
+const REQUEST_TIMEOUT_MS = parsePositiveInt(process.env.REQUEST_TIMEOUT_MS, 30_000);
+const SHUTDOWN_GRACE_MS = parsePositiveInt(process.env.SHUTDOWN_GRACE_MS, 10_000);
 const ROOT = __dirname;
+const STATIC_CACHE_SECONDS = IS_PRODUCTION ? 3600 : 0;
+const rateLimitBuckets = new Map();
+
+validateConfig();
 
 function loadEnvFile(filePath) {
   if (!fs.existsSync(filePath)) return;
@@ -28,6 +38,30 @@ function loadEnvFile(filePath) {
     const value = rawValue.replace(/^["']|["']$/g, "");
     if (!process.env[key]) process.env[key] = value;
   });
+}
+
+function parsePort(value, fallback) {
+  const port = Number(value || fallback);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error(`Invalid PORT "${value}". Expected a number from 1 to 65535.`);
+  }
+  return port;
+}
+
+function parsePositiveInt(value, fallback) {
+  const parsed = Number(value || fallback);
+  if (!Number.isInteger(parsed) || parsed <= 0) return fallback;
+  return parsed;
+}
+
+function validateConfig() {
+  if (IS_PRODUCTION && !WEBHOOK_TOKEN) {
+    console.warn("Production warning: GITLAB_WEBHOOK_TOKEN is not set; webhook endpoint will reject requests.");
+  }
+
+  if (IS_PRODUCTION && Boolean(GITLAB_TOKEN) !== Boolean(GITLAB_PROJECT_ID)) {
+    throw new Error("Set both GITLAB_TOKEN and GITLAB_PROJECT_ID, or neither, in production.");
+  }
 }
 
 const steps = [
@@ -425,6 +459,7 @@ async function buildGitLabInvestigation(pipelineId) {
 
 function writeJson(res, statusCode, payload) {
   const body = JSON.stringify(payload, null, 2);
+  applyCommonHeaders(res);
   res.writeHead(statusCode, {
     "Content-Type": "application/json; charset=utf-8",
     "Cache-Control": "no-store"
@@ -437,7 +472,7 @@ function readJson(req) {
     let body = "";
     req.on("data", (chunk) => {
       body += chunk;
-      if (body.length > 1_000_000) {
+      if (body.length > BODY_LIMIT_BYTES) {
         req.destroy();
         reject(new Error("Payload too large"));
       }
@@ -454,6 +489,43 @@ function readJson(req) {
       }
     });
   });
+}
+
+function applyCommonHeaders(res) {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  res.setHeader(
+    "Content-Security-Policy",
+    "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+  );
+}
+
+function getClientIp(req) {
+  return req.socket.remoteAddress || "unknown";
+}
+
+function isRateLimited(req) {
+  const ip = getClientIp(req);
+  const now = Date.now();
+  const windowMs = 60_000;
+  const current = rateLimitBuckets.get(ip);
+
+  if (!current || now - current.startedAt >= windowMs) {
+    rateLimitBuckets.set(ip, { count: 1, startedAt: now });
+    return false;
+  }
+
+  current.count += 1;
+  return current.count > API_RATE_LIMIT_PER_MINUTE;
+}
+
+function cleanupRateLimitBuckets() {
+  const cutoff = Date.now() - 120_000;
+  for (const [ip, bucket] of rateLimitBuckets.entries()) {
+    if (bucket.startedAt < cutoff) rateLimitBuckets.delete(ip);
+  }
 }
 
 function audit(action, details) {
@@ -523,6 +595,7 @@ function buildInvestigation(pipeline) {
 }
 
 function verifyWebhook(req) {
+  if (IS_PRODUCTION && !WEBHOOK_TOKEN) return false;
   if (!WEBHOOK_TOKEN) return true;
   const provided = req.headers["x-gitlab-token"] || "";
   const providedBuffer = Buffer.from(provided);
@@ -532,11 +605,38 @@ function verifyWebhook(req) {
 }
 
 function routeStatic(req, res) {
-  const url = new URL(req.url, `http://${req.headers.host}`);
-  const requestedPath = url.pathname === "/" ? "/index.html" : url.pathname;
-  const filePath = path.normalize(path.join(ROOT, requestedPath));
+  if (req.method !== "GET" && req.method !== "HEAD") {
+    applyCommonHeaders(res);
+    res.writeHead(405, { Allow: "GET, HEAD" });
+    res.end("Method not allowed");
+    return;
+  }
 
-  if (!filePath.startsWith(ROOT)) {
+  let url;
+  try {
+    url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+  } catch {
+    applyCommonHeaders(res);
+    res.writeHead(400);
+    res.end("Bad request");
+    return;
+  }
+
+  let requestedPath;
+  try {
+    requestedPath = decodeURIComponent(url.pathname === "/" ? "/index.html" : url.pathname);
+  } catch {
+    applyCommonHeaders(res);
+    res.writeHead(400);
+    res.end("Bad request");
+    return;
+  }
+
+  const filePath = path.resolve(ROOT, `.${requestedPath}`);
+  const relativePath = path.relative(ROOT, filePath);
+
+  if (relativePath.startsWith("..") || path.isAbsolute(relativePath)) {
+    applyCommonHeaders(res);
     res.writeHead(403);
     res.end("Forbidden");
     return;
@@ -551,6 +651,7 @@ function routeStatic(req, res) {
   const type = allowed.get(path.extname(filePath));
 
   if (!type) {
+    applyCommonHeaders(res);
     res.writeHead(404);
     res.end("Not found");
     return;
@@ -558,21 +659,30 @@ function routeStatic(req, res) {
 
   fs.readFile(filePath, (error, data) => {
     if (error) {
+      applyCommonHeaders(res);
       res.writeHead(404);
       res.end("Not found");
       return;
     }
-    res.writeHead(200, { "Content-Type": type });
-    res.end(data);
+    applyCommonHeaders(res);
+    res.writeHead(200, {
+      "Content-Type": type,
+      "Cache-Control": STATIC_CACHE_SECONDS
+        ? `public, max-age=${STATIC_CACHE_SECONDS}`
+        : "no-cache"
+    });
+    res.end(req.method === "HEAD" ? undefined : data);
   });
 }
 
 async function routeApi(req, res) {
-  const url = new URL(req.url, `http://${req.headers.host}`);
+  const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
 
   if (req.method === "GET" && url.pathname === "/api/health") {
     writeJson(res, 200, {
       ok: true,
+      env: NODE_ENV,
+      uptimeSeconds: Math.round(process.uptime()),
       mode: USE_GITLAB ? "gitlab-live-readonly" : "mock-gitlab-mcp",
       webhookVerification: WEBHOOK_TOKEN ? "enabled" : "disabled",
       gitlab: {
@@ -660,6 +770,13 @@ async function routeApi(req, res) {
 }
 
 const server = http.createServer((req, res) => {
+  req.setTimeout(REQUEST_TIMEOUT_MS);
+
+  if (isRateLimited(req)) {
+    writeJson(res, 429, { error: "Too many requests" });
+    return;
+  }
+
   if (!req.url.startsWith("/api/") && !req.url.startsWith("/webhooks/")) {
     routeStatic(req, res);
     return;
@@ -671,6 +788,34 @@ const server = http.createServer((req, res) => {
   });
 });
 
+server.keepAliveTimeout = 65_000;
+server.headersTimeout = 66_000;
+server.requestTimeout = REQUEST_TIMEOUT_MS;
+
 server.listen(PORT, () => {
-  console.log(`DevOps Medic listening on http://localhost:${PORT}`);
+  console.log(`DevOps Medic listening on http://localhost:${PORT} (${NODE_ENV})`);
 });
+
+server.on("clientError", (error, socket) => {
+  audit("server.client_error", { message: error.message });
+  if (socket.writable) socket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
+});
+
+const rateLimitCleanupTimer = setInterval(cleanupRateLimitBuckets, 60_000);
+rateLimitCleanupTimer.unref();
+
+function shutdown(signal) {
+  console.log(`${signal} received, shutting down.`);
+  server.close(() => {
+    clearInterval(rateLimitCleanupTimer);
+    process.exit(0);
+  });
+
+  setTimeout(() => {
+    console.error("Graceful shutdown timed out.");
+    process.exit(1);
+  }, SHUTDOWN_GRACE_MS).unref();
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
