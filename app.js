@@ -1,140 +1,4 @@
-const pipelines = [
-  {
-    id: "#12841",
-    job: "unit:test",
-    branch: "feature/cache-layer",
-    mr: "!482",
-    failedAgo: "7 min ago",
-    confidence: 91,
-    title: "Cache service regression",
-    reason: "TypeError in cache adapter test",
-    trace: [
-      "$ npm run test:unit",
-      "",
-      "FAIL test/cache-adapter.spec.ts",
-      "  CacheAdapter",
-      "    x returns fallback value when Redis is unavailable",
-      "",
-      "TypeError: Cannot read properties of undefined (reading 'ttl')",
-      "  at CacheAdapter.get src/cache/cache-adapter.ts:42:21",
-      "  at Object.<anonymous> test/cache-adapter.spec.ts:18:28",
-      "",
-      "Tests: 1 failed, 23 passed"
-    ].join("\n"),
-    files: [
-      {
-        path: "src/cache/cache-adapter.ts",
-        note: "Stack trace points to an unguarded options.ttl read when test config omits cache options."
-      },
-      {
-        path: "test/cache-adapter.spec.ts",
-        note: "Regression test expects fallback behavior while Redis is unavailable."
-      }
-    ],
-    patch: [
-      "diff --git a/src/cache/cache-adapter.ts b/src/cache/cache-adapter.ts",
-      "@@",
-      "- const ttl = options.ttl;",
-      "+ const ttl = options?.ttl ?? DEFAULT_CACHE_TTL;",
-      "",
-      "  if (!this.client.isReady) {",
-      "    return fallbackValue;",
-      "  }"
-    ].join("\n"),
-    mr: {
-      broke: "The unit:test job failed because CacheAdapter.get attempted to read options.ttl when options was undefined.",
-      why: "The new cache-layer branch made the options object optional in the test path, but the adapter still treated it as required.",
-      fixed: "The patch applies a default TTL with optional chaining and keeps the Redis-unavailable fallback behavior intact."
-    }
-  },
-  {
-    id: "#12836",
-    job: "build:web",
-    branch: "feature/billing-tabs",
-    mr: "!477",
-    failedAgo: "21 min ago",
-    confidence: 87,
-    title: "Billing UI compile failure",
-    reason: "Missing exported type",
-    trace: [
-      "$ npm run build",
-      "",
-      "src/pages/billing/BillingTabs.tsx:6:10 - error TS2305:",
-      "Module './types' has no exported member 'InvoiceTab'.",
-      "",
-      "6 import { InvoiceTab } from './types';",
-      "           ~~~~~~~~~~",
-      "",
-      "Found 1 error."
-    ].join("\n"),
-    files: [
-      {
-        path: "src/pages/billing/BillingTabs.tsx",
-        note: "Imports InvoiceTab from a local type barrel."
-      },
-      {
-        path: "src/pages/billing/types.ts",
-        note: "Recent diff renamed InvoiceTab to BillingTab without updating all imports."
-      }
-    ],
-    patch: [
-      "diff --git a/src/pages/billing/BillingTabs.tsx b/src/pages/billing/BillingTabs.tsx",
-      "@@",
-      "- import { InvoiceTab } from './types';",
-      "+ import { BillingTab } from './types';",
-      "",
-      "- const tabs: InvoiceTab[] = [",
-      "+ const tabs: BillingTab[] = ["
-    ].join("\n"),
-    mr: {
-      broke: "The build:web job failed with TS2305 because BillingTabs imported an old type name.",
-      why: "A previous refactor renamed InvoiceTab to BillingTab but left one stale import and annotation.",
-      fixed: "The patch updates the import and local tab array annotation to the current BillingTab export."
-    }
-  },
-  {
-    id: "#12822",
-    job: "integration:db",
-    branch: "fix/report-export",
-    mr: "!468",
-    failedAgo: "43 min ago",
-    confidence: 83,
-    title: "Report export database test",
-    reason: "Missing migration column",
-    trace: [
-      "$ npm run test:integration",
-      "",
-      "QueryFailedError: column report_exports.format does not exist",
-      "  at PostgresQueryRunner.query src/db/PostgresQueryRunner.ts:331:19",
-      "  at ReportExportRepository.create src/reports/report-export.repository.ts:57:12",
-      "",
-      "Hint: Perhaps you meant to reference the column \"report_exports.file_format\"."
-    ].join("\n"),
-    files: [
-      {
-        path: "src/reports/report-export.repository.ts",
-        note: "Insert statement references format, but current migration exposes file_format."
-      },
-      {
-        path: "migrations/202605301130_report_exports.sql",
-        note: "Schema already contains file_format; repository drift caused the failure."
-      }
-    ],
-    patch: [
-      "diff --git a/src/reports/report-export.repository.ts b/src/reports/report-export.repository.ts",
-      "@@",
-      "- format: input.format,",
-      "+ file_format: input.format,"
-    ].join("\n"),
-    mr: {
-      broke: "The integration:db job failed because the repository attempted to insert into report_exports.format.",
-      why: "The migration defines file_format, while the repository used the pre-review column name.",
-      fixed: "The patch maps input.format to the existing file_format column without changing the database schema."
-    }
-  }
-];
-
-const steps = [
+const fallbackSteps = [
   {
     title: "Fetch failed pipeline",
     body: "Using pipelines tool to inspect pipeline execution details and identify failed jobs."
@@ -158,8 +22,10 @@ const steps = [
 ];
 
 const state = {
-  selected: pipelines[0],
-  running: false
+  pipelines: [],
+  selected: null,
+  running: false,
+  latestInvestigation: null
 };
 
 const pipelineList = document.querySelector("#pipelineList");
@@ -179,28 +45,59 @@ const runMedic = document.querySelector("#runMedic");
 const resetDemo = document.querySelector("#resetDemo");
 const openMr = document.querySelector("#openMr");
 const copyTrace = document.querySelector("#copyTrace");
+const projectValue = document.querySelector("#projectValue");
+const modeValue = document.querySelector("#modeValue");
+
+async function api(path, options = {}) {
+  const response = await fetch(path, {
+    headers: { "Content-Type": "application/json" },
+    ...options
+  });
+
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({ error: response.statusText }));
+    throw new Error(payload.error || "Request failed");
+  }
+
+  return response.json();
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+function setAgentState(label, className = "") {
+  agentState.textContent = label;
+  agentState.className = `pill${className ? ` ${className}` : ""}`;
+}
 
 function renderPipelines() {
   pipelineList.innerHTML = "";
 
-  pipelines.forEach((pipeline) => {
+  state.pipelines.forEach((pipeline) => {
     const card = document.createElement("button");
     card.type = "button";
-    card.className = `pipeline-card${pipeline.id === state.selected.id ? " active" : ""}`;
+    card.className = `pipeline-card${pipeline.id === state.selected?.id ? " active" : ""}`;
     card.innerHTML = `
-      <strong>${pipeline.title}</strong>
+      <strong>${escapeHtml(pipeline.title)}</strong>
       <div class="pipeline-meta">
-        <span>${pipeline.id}</span>
-        <span>${pipeline.job}</span>
-        <span>${pipeline.failedAgo}</span>
+        <span>${escapeHtml(pipeline.displayId)}</span>
+        <span>${escapeHtml(pipeline.job)}</span>
+        <span>${escapeHtml(pipeline.failedAgo)}</span>
       </div>
       <div class="pipeline-meta">
-        <span>${pipeline.reason}</span>
+        <span>${escapeHtml(pipeline.reason)}</span>
       </div>
     `;
     card.addEventListener("click", () => {
       if (state.running) return;
       state.selected = pipeline;
+      state.latestInvestigation = null;
       resetInvestigation();
       renderPipelines();
       renderSelected();
@@ -210,31 +107,39 @@ function renderPipelines() {
 }
 
 function renderSelected() {
+  if (!state.selected) {
+    pipelineId.textContent = "-";
+    jobName.textContent = "-";
+    branchName.textContent = "-";
+    confidenceValue.textContent = "0%";
+    traceOutput.textContent = "No pipeline loaded.";
+    return;
+  }
+
   const pipeline = state.selected;
-  pipelineId.textContent = pipeline.id;
+  pipelineId.textContent = pipeline.displayId;
   jobName.textContent = pipeline.job;
   branchName.textContent = pipeline.branch;
   confidenceValue.textContent = "0%";
-  traceOutput.textContent = "Raw trace will appear after the medic reads job logs.";
+  traceOutput.textContent = "Raw trace will appear after the backend reads job logs.";
   fileStack.innerHTML = `<div class="file-card"><strong>Waiting for MCP search</strong><p>Source context appears here after stack trace mapping.</p></div>`;
   filesTouched.textContent = "0 files";
   patchOutput.textContent = "No patch drafted yet.";
   patchState.textContent = "not drafted";
-  mrCopy.textContent = "Select a failed pipeline and run the medic to generate a merge request summary.";
+  mrCopy.textContent = "Run the medic to generate a merge request summary with approval controls.";
   openMr.disabled = true;
 }
 
-function resetInvestigation() {
-  agentState.textContent = "idle";
-  agentState.className = "pill";
+function resetInvestigation(steps = fallbackSteps) {
+  setAgentState("idle");
   timeline.innerHTML = "";
   steps.forEach((step) => {
     const item = document.createElement("li");
     item.innerHTML = `
       <span class="timeline-marker" aria-hidden="true"></span>
       <div>
-        <strong>${step.title}</strong>
-        <span>${step.body}</span>
+        <strong>${escapeHtml(step.title)}</strong>
+        <span>${escapeHtml(step.body)}</span>
       </div>
     `;
     timeline.appendChild(item);
@@ -248,77 +153,138 @@ function wait(ms) {
 }
 
 async function runInvestigation() {
-  if (state.running) return;
+  if (state.running || !state.selected) return;
 
   state.running = true;
   runMedic.disabled = true;
   resetDemo.disabled = true;
-  agentState.textContent = "running";
-  agentState.className = "pill warning";
+  setAgentState("requesting backend", "warning");
   renderSelected();
   resetInvestigation();
 
+  try {
+    const payload = await api(`/api/investigations/${state.selected.id}/run`, { method: "POST" });
+    const investigation = payload.investigation;
+    state.latestInvestigation = investigation;
+    resetInvestigation(investigation.steps);
+    await animateInvestigation(investigation);
+    setAgentState("ready for review", "success");
+  } catch (error) {
+    setAgentState("failed", "danger");
+    traceOutput.textContent = error.message;
+  } finally {
+    runMedic.disabled = false;
+    resetDemo.disabled = false;
+    state.running = false;
+  }
+}
+
+async function animateInvestigation(investigation) {
   const items = [...timeline.querySelectorAll("li")];
 
   for (let index = 0; index < items.length; index += 1) {
+    setAgentState(investigation.steps[index]?.title || "running", "warning");
     items[index].classList.add("complete");
 
     if (index === 1) {
-      traceOutput.textContent = state.selected.trace;
+      traceOutput.textContent = investigation.evidence.trace;
     }
 
     if (index === 2) {
-      renderFiles();
-      confidenceValue.textContent = `${Math.max(state.selected.confidence - 18, 60)}%`;
+      renderFiles(investigation.evidence.files);
+      confidenceValue.textContent = `${Math.max(investigation.confidence - 18, 60)}%`;
     }
 
     if (index === 3) {
-      patchOutput.textContent = state.selected.patch;
-      patchState.textContent = "drafted";
+      patchOutput.textContent = investigation.patch.diff;
+      patchState.textContent = investigation.patch.state;
     }
 
     if (index === 4) {
-      confidenceValue.textContent = `${state.selected.confidence}%`;
-      renderMergeRequest();
+      confidenceValue.textContent = `${investigation.confidence}%`;
+      renderMergeRequest(investigation);
       openMr.disabled = false;
     }
 
-    await wait(620);
+    await wait(520);
   }
-
-  agentState.textContent = "ready for review";
-  agentState.className = "pill success";
-  runMedic.disabled = false;
-  resetDemo.disabled = false;
-  state.running = false;
 }
 
-function renderFiles() {
+function renderFiles(files) {
   fileStack.innerHTML = "";
-  state.selected.files.forEach((file) => {
+  files.forEach((file) => {
     const article = document.createElement("article");
     article.className = "file-card";
-    article.innerHTML = `<strong>${file.path}</strong><p>${file.note}</p>`;
+    article.innerHTML = `<strong>${escapeHtml(file.path)}</strong><p>${escapeHtml(file.note)}</p>`;
     fileStack.appendChild(article);
   });
-  filesTouched.textContent = `${state.selected.files.length} files`;
+  filesTouched.textContent = `${files.length} files`;
 }
 
-function renderMergeRequest() {
-  const branch = `devops-medic/patch-pipeline-${state.selected.id.replace("#", "")}`;
+function renderMergeRequest(investigation) {
+  const description = investigation.mergeRequest.description;
+  const gitlabLinks = investigation.gitlab
+    ? `
+      <div class="control-grid">
+        <span>Pipeline</span>
+        <strong><a href="${escapeHtml(investigation.gitlab.pipelineUrl)}" target="_blank" rel="noreferrer">Open</a></strong>
+        <span>Failed job</span>
+        <strong><a href="${escapeHtml(investigation.gitlab.jobUrl)}" target="_blank" rel="noreferrer">Open</a></strong>
+        <span>Source MR</span>
+        <strong>${investigation.gitlab.mergeRequestUrl ? `<a href="${escapeHtml(investigation.gitlab.mergeRequestUrl)}" target="_blank" rel="noreferrer">Open</a>` : "Not found"}</strong>
+      </div>
+    `
+    : "";
+
   mrCopy.innerHTML = `
-    <h4>${branch}</h4>
-    <p><strong>What broke:</strong> ${state.selected.mr.broke}</p>
-    <p><strong>Why it broke:</strong> ${state.selected.mr.why}</p>
-    <p><strong>How it was fixed:</strong> ${state.selected.mr.fixed}</p>
-    <p><strong>Validation:</strong> Re-run ${state.selected.job} for ${state.selected.branch} before merge.</p>
+    <h4>${escapeHtml(investigation.mergeRequest.branch)}</h4>
+    <p><strong>What broke:</strong> ${escapeHtml(description.broke)}</p>
+    <p><strong>Why it broke:</strong> ${escapeHtml(description.why)}</p>
+    <p><strong>How it was fixed:</strong> ${escapeHtml(description.fixed)}</p>
+    <p><strong>Validation:</strong> ${escapeHtml(description.validation)}</p>
+    ${gitlabLinks}
+    <div class="control-grid">
+      <span>Human approval required</span>
+      <strong>${investigation.controls.humanApprovalRequired ? "Yes" : "No"}</strong>
+      <span>Protected branch push</span>
+      <strong>${investigation.controls.protectedBranchPush ? "Allowed" : "Blocked"}</strong>
+      <span>Patch size limit</span>
+      <strong>${investigation.controls.maxPatchBytes} bytes</strong>
+    </div>
   `;
+}
+
+async function loadPipelines() {
+  setAgentState("connecting", "warning");
+
+  try {
+    const health = await api("/api/health");
+    const payload = await api("/api/pipelines");
+    state.pipelines = payload.pipelines;
+    state.selected = state.pipelines[0] || null;
+    setAgentState(health.mode, health.gitlab?.configured ? "success" : "");
+    projectValue.textContent = health.gitlab?.configured ? `GitLab ${health.gitlab.projectId}` : "Mock project";
+    modeValue.textContent = health.gitlab?.configured ? "Live read-only" : "MR ready";
+    renderPipelines();
+    resetInvestigation();
+    renderSelected();
+
+    if (!state.selected) {
+      pipelineList.innerHTML = `<div class="file-card"><strong>No failed pipelines</strong><p>The configured GitLab project has no recent failed pipelines.</p></div>`;
+    }
+  } catch (error) {
+    setAgentState("backend offline", "danger");
+    pipelineList.innerHTML = `<div class="file-card"><strong>Backend unavailable</strong><p>${escapeHtml(error.message)}</p></div>`;
+    traceOutput.textContent = "Start the backend with: node server.js";
+    runMedic.disabled = true;
+  }
 }
 
 runMedic.addEventListener("click", runInvestigation);
 
 resetDemo.addEventListener("click", () => {
   if (state.running) return;
+  state.latestInvestigation = null;
   resetInvestigation();
   renderSelected();
 });
@@ -342,8 +308,9 @@ copyTrace.addEventListener("click", async () => {
 });
 
 openMr.addEventListener("click", () => {
-  if (openMr.disabled) return;
-  openMr.textContent = "MR drafted";
+  if (openMr.disabled || !state.latestInvestigation) return;
+  openMr.textContent = "Approval queued";
+  setAgentState("awaiting approval", "warning");
   window.setTimeout(() => {
     openMr.textContent = "Open MR";
   }, 1000);
@@ -356,6 +323,59 @@ document.querySelectorAll(".nav-item").forEach((button) => {
   });
 });
 
-renderPipelines();
+function closeMenus() {
+  document.querySelectorAll("[data-menu-trigger]").forEach((trigger) => {
+    trigger.setAttribute("aria-expanded", "false");
+  });
+  document.querySelectorAll(".dropdown-menu").forEach((menu) => {
+    menu.classList.remove("open");
+  });
+}
+
+document.querySelectorAll("[data-menu-trigger]").forEach((trigger) => {
+  trigger.addEventListener("click", (event) => {
+    event.stopPropagation();
+    const menu = document.querySelector(`#${trigger.dataset.menuTrigger}`);
+    const isOpen = menu.classList.contains("open");
+    closeMenus();
+    if (!isOpen) {
+      trigger.setAttribute("aria-expanded", "true");
+      menu.classList.add("open");
+      menu.querySelector("button")?.focus();
+    }
+  });
+});
+
+document.querySelectorAll(".dropdown-menu button").forEach((item) => {
+  item.addEventListener("click", () => {
+    const menu = item.closest(".dropdown-menu");
+    const value = item.dataset.menuValue;
+
+    if (menu.id === "projectMenu") {
+      projectValue.textContent = value;
+      setAgentState(`project: ${value}`);
+    }
+
+    if (menu.id === "modeMenu") {
+      modeValue.textContent = value;
+      setAgentState(`mode: ${value}`);
+    }
+
+    if (menu.id === "safetyMenu") {
+      setAgentState(value, "success");
+    }
+
+    closeMenus();
+  });
+});
+
+document.addEventListener("click", closeMenus);
+
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    closeMenus();
+  }
+});
+
 resetInvestigation();
-renderSelected();
+loadPipelines();

@@ -58,6 +58,39 @@
             <h2>Failed pipeline investigation</h2>
           </div>
           <div class="topbar-actions">
+            <div class="menu-group">
+              <button class="menu-button" type="button" data-menu-trigger="projectMenu" aria-haspopup="menu" aria-expanded="false">
+                Project
+                <span aria-hidden="true">v</span>
+              </button>
+              <div class="dropdown-menu" id="projectMenu" role="menu">
+                <button type="button" role="menuitem" data-menu-value="Platform API">Platform API</button>
+                <button type="button" role="menuitem" data-menu-value="Billing Web">Billing Web</button>
+                <button type="button" role="menuitem" data-menu-value="Reporting Service">Reporting Service</button>
+              </div>
+            </div>
+            <div class="menu-group">
+              <button class="menu-button" type="button" data-menu-trigger="modeMenu" aria-haspopup="menu" aria-expanded="false">
+                Mode
+                <span aria-hidden="true">v</span>
+              </button>
+              <div class="dropdown-menu" id="modeMenu" role="menu">
+                <button type="button" role="menuitem" data-menu-value="Evidence only">Evidence only</button>
+                <button type="button" role="menuitem" data-menu-value="Draft patch">Draft patch</button>
+                <button type="button" role="menuitem" data-menu-value="MR ready">MR ready</button>
+              </div>
+            </div>
+            <div class="menu-group">
+              <button class="menu-button" type="button" data-menu-trigger="safetyMenu" aria-haspopup="menu" aria-expanded="false">
+                Safety
+                <span aria-hidden="true">v</span>
+              </button>
+              <div class="dropdown-menu" id="safetyMenu" role="menu">
+                <button type="button" role="menuitem" data-menu-value="Approval required">Approval required</button>
+                <button type="button" role="menuitem" data-menu-value="Patch limits on">Patch limits on</button>
+                <button type="button" role="menuitem" data-menu-value="Audit trail on">Audit trail on</button>
+              </div>
+            </div>
             <button class="secondary-button" id="resetDemo" type="button">Reset</button>
             <button class="primary-button" id="runMedic" type="button">
               <span class="button-dot" aria-hidden="true"></span>
@@ -86,6 +119,11 @@
             <span class="status-label">Confidence</span>
             <strong id="confidenceValue">0%</strong>
             <small>waiting for logs</small>
+          </article>
+          <article>
+            <span class="status-label">Project</span>
+            <strong id="projectValue">Platform API</strong>
+            <small id="modeValue">MR ready</small>
           </article>
         </section>
 

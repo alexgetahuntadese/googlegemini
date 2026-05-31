@@ -1,0 +1,676 @@
+const http = require("http");
+const fs = require("fs");
+const path = require("path");
+const crypto = require("crypto");
+
+loadEnvFile(path.join(__dirname, ".env"));
+
+const PORT = Number(process.env.PORT || 4173);
+const WEBHOOK_TOKEN = process.env.GITLAB_WEBHOOK_TOKEN || "";
+const GITLAB_BASE_URL = (process.env.GITLAB_BASE_URL || "https://gitlab.com").replace(/\/$/, "");
+const GITLAB_TOKEN = process.env.GITLAB_TOKEN || "";
+const GITLAB_PROJECT_ID = process.env.GITLAB_PROJECT_ID || "";
+const USE_GITLAB = Boolean(GITLAB_TOKEN && GITLAB_PROJECT_ID);
+const ROOT = __dirname;
+
+function loadEnvFile(filePath) {
+  if (!fs.existsSync(filePath)) return;
+
+  const lines = fs.readFileSync(filePath, "utf8").split(/\r?\n/);
+  lines.forEach((line) => {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) return;
+    const separator = trimmed.indexOf("=");
+    if (separator === -1) return;
+
+    const key = trimmed.slice(0, separator).trim();
+    const rawValue = trimmed.slice(separator + 1).trim();
+    const value = rawValue.replace(/^["']|["']$/g, "");
+    if (!process.env[key]) process.env[key] = value;
+  });
+}
+
+const steps = [
+  {
+    id: "fetch_pipeline",
+    title: "Fetch failed pipeline",
+    body: "Using pipelines tool to inspect pipeline execution details and identify failed jobs."
+  },
+  {
+    id: "pull_trace",
+    title: "Pull raw job trace",
+    body: "Reading stderr and raw logs before attempting any diagnosis."
+  },
+  {
+    id: "map_context",
+    title: "Map stack trace to code",
+    body: "Using repository search to fetch source files, tests, and recent merge request diffs."
+  },
+  {
+    id: "draft_patch",
+    title: "Draft minimal patch",
+    body: "Creating the smallest change that resolves the observed failure."
+  },
+  {
+    id: "prepare_mr",
+    title: "Prepare merge request",
+    body: "Writing a human-reviewable MR with failure, cause, and fix sections."
+  }
+];
+
+const pipelines = [
+  {
+    id: "12841",
+    job: "unit:test",
+    branch: "feature/cache-layer",
+    mr: "!482",
+    failedAgo: "7 min ago",
+    confidence: 91,
+    title: "Cache service regression",
+    reason: "TypeError in cache adapter test",
+    status: "failed",
+    runner: "Node 20 runner",
+    trace: [
+      "$ npm run test:unit",
+      "",
+      "FAIL test/cache-adapter.spec.ts",
+      "  CacheAdapter",
+      "    x returns fallback value when Redis is unavailable",
+      "",
+      "TypeError: Cannot read properties of undefined (reading 'ttl')",
+      "  at CacheAdapter.get src/cache/cache-adapter.ts:42:21",
+      "  at Object.<anonymous> test/cache-adapter.spec.ts:18:28",
+      "",
+      "Tests: 1 failed, 23 passed"
+    ].join("\n"),
+    files: [
+      {
+        path: "src/cache/cache-adapter.ts",
+        note: "Stack trace points to an unguarded options.ttl read when test config omits cache options."
+      },
+      {
+        path: "test/cache-adapter.spec.ts",
+        note: "Regression test expects fallback behavior while Redis is unavailable."
+      }
+    ],
+    patch: [
+      "diff --git a/src/cache/cache-adapter.ts b/src/cache/cache-adapter.ts",
+      "@@",
+      "- const ttl = options.ttl;",
+      "+ const ttl = options?.ttl ?? DEFAULT_CACHE_TTL;",
+      "",
+      "  if (!this.client.isReady) {",
+      "    return fallbackValue;",
+      "  }"
+    ].join("\n"),
+    mr: {
+      broke: "The unit:test job failed because CacheAdapter.get attempted to read options.ttl when options was undefined.",
+      why: "The new cache-layer branch made the options object optional in the test path, but the adapter still treated it as required.",
+      fixed: "The patch applies a default TTL with optional chaining and keeps the Redis-unavailable fallback behavior intact."
+    }
+  },
+  {
+    id: "12836",
+    job: "build:web",
+    branch: "feature/billing-tabs",
+    mr: "!477",
+    failedAgo: "21 min ago",
+    confidence: 87,
+    title: "Billing UI compile failure",
+    reason: "Missing exported type",
+    status: "failed",
+    runner: "Node 20 runner",
+    trace: [
+      "$ npm run build",
+      "",
+      "src/pages/billing/BillingTabs.tsx:6:10 - error TS2305:",
+      "Module './types' has no exported member 'InvoiceTab'.",
+      "",
+      "6 import { InvoiceTab } from './types';",
+      "           ~~~~~~~~~~",
+      "",
+      "Found 1 error."
+    ].join("\n"),
+    files: [
+      {
+        path: "src/pages/billing/BillingTabs.tsx",
+        note: "Imports InvoiceTab from a local type barrel."
+      },
+      {
+        path: "src/pages/billing/types.ts",
+        note: "Recent diff renamed InvoiceTab to BillingTab without updating all imports."
+      }
+    ],
+    patch: [
+      "diff --git a/src/pages/billing/BillingTabs.tsx b/src/pages/billing/BillingTabs.tsx",
+      "@@",
+      "- import { InvoiceTab } from './types';",
+      "+ import { BillingTab } from './types';",
+      "",
+      "- const tabs: InvoiceTab[] = [",
+      "+ const tabs: BillingTab[] = ["
+    ].join("\n"),
+    mr: {
+      broke: "The build:web job failed with TS2305 because BillingTabs imported an old type name.",
+      why: "A previous refactor renamed InvoiceTab to BillingTab but left one stale import and annotation.",
+      fixed: "The patch updates the import and local tab array annotation to the current BillingTab export."
+    }
+  },
+  {
+    id: "12822",
+    job: "integration:db",
+    branch: "fix/report-export",
+    mr: "!468",
+    failedAgo: "43 min ago",
+    confidence: 83,
+    title: "Report export database test",
+    reason: "Missing migration column",
+    status: "failed",
+    runner: "Postgres 16 service",
+    trace: [
+      "$ npm run test:integration",
+      "",
+      "QueryFailedError: column report_exports.format does not exist",
+      "  at PostgresQueryRunner.query src/db/PostgresQueryRunner.ts:331:19",
+      "  at ReportExportRepository.create src/reports/report-export.repository.ts:57:12",
+      "",
+      "Hint: Perhaps you meant to reference the column \"report_exports.file_format\"."
+    ].join("\n"),
+    files: [
+      {
+        path: "src/reports/report-export.repository.ts",
+        note: "Insert statement references format, but current migration exposes file_format."
+      },
+      {
+        path: "migrations/202605301130_report_exports.sql",
+        note: "Schema already contains file_format; repository drift caused the failure."
+      }
+    ],
+    patch: [
+      "diff --git a/src/reports/report-export.repository.ts b/src/reports/report-export.repository.ts",
+      "@@",
+      "- format: input.format,",
+      "+ file_format: input.format,"
+    ].join("\n"),
+    mr: {
+      broke: "The integration:db job failed because the repository attempted to insert into report_exports.format.",
+      why: "The migration defines file_format, while the repository used the pre-review column name.",
+      fixed: "The patch maps input.format to the existing file_format column without changing the database schema."
+    }
+  }
+];
+
+const investigations = new Map();
+const auditLog = [];
+
+function gitlabUrl(pathname, params = {}) {
+  const url = new URL(`${GITLAB_BASE_URL}/api/v4${pathname}`);
+  Object.entries(params).forEach(([key, value]) => {
+    if (value === undefined || value === null || value === "") return;
+    if (Array.isArray(value)) {
+      value.forEach((item) => url.searchParams.append(key, item));
+      return;
+    }
+    url.searchParams.set(key, value);
+  });
+  return url;
+}
+
+async function gitlabFetch(pathname, params = {}, options = {}) {
+  if (!USE_GITLAB) {
+    throw new Error("GitLab is not configured. Set GITLAB_TOKEN and GITLAB_PROJECT_ID.");
+  }
+
+  const response = await fetch(gitlabUrl(pathname, params), {
+    ...options,
+    headers: {
+      "PRIVATE-TOKEN": GITLAB_TOKEN,
+      "User-Agent": "devops-medic/0.1",
+      ...(options.headers || {})
+    }
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`GitLab ${response.status}: ${text.slice(0, 240)}`);
+  }
+
+  const contentType = response.headers.get("content-type") || "";
+  if (contentType.includes("application/json")) return response.json();
+  return response.text();
+}
+
+function projectPath(pathname) {
+  return `/projects/${encodeURIComponent(GITLAB_PROJECT_ID)}${pathname}`;
+}
+
+function shortTimeAgo(isoDate) {
+  const date = new Date(isoDate);
+  if (Number.isNaN(date.getTime())) return "recently";
+
+  const seconds = Math.max(1, Math.floor((Date.now() - date.getTime()) / 1000));
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} min ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} hr ago`;
+  return `${Math.floor(hours / 24)} days ago`;
+}
+
+function extractTraceSignal(trace) {
+  const lines = trace.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const errorLine = lines.find((line) => /error|exception|failed|fatal|typeerror|referenceerror/i.test(line));
+  return errorLine || lines.slice(-1)[0] || "Failed job trace available";
+}
+
+function extractFilePaths(trace) {
+  const matches = new Set();
+  const pattern = /(?:^|\s|["'(`])((?:[\w.-]+\/)+[\w.-]+\.(?:js|jsx|ts|tsx|mjs|cjs|py|go|rb|java|kt|cs|php|rs|sql|yml|yaml|json|toml|xml|html|css|scss))(?:[:)\]"'`\s]|$)/gi;
+  let match = pattern.exec(trace);
+
+  while (match) {
+    matches.add(match[1].replace(/^\.?\//, ""));
+    match = pattern.exec(trace);
+  }
+
+  return [...matches].slice(0, 6);
+}
+
+async function listFailedPipelinesFromGitLab() {
+  const rawPipelines = await gitlabFetch(projectPath("/pipelines"), {
+    status: "failed",
+    per_page: "12",
+    order_by: "updated_at",
+    sort: "desc"
+  });
+
+  const hydrated = await Promise.all(rawPipelines.map(async (pipeline) => {
+    const jobs = await gitlabFetch(projectPath(`/pipelines/${pipeline.id}/jobs`), {
+      "scope[]": "failed",
+      per_page: "5"
+    }).catch(() => []);
+    const job = jobs[0] || {};
+
+    return {
+      id: String(pipeline.id),
+      jobId: job.id ? String(job.id) : "",
+      job: job.name || "failed job",
+      branch: pipeline.ref || "unknown-ref",
+      mr: "",
+      failedAgo: shortTimeAgo(job.finished_at || pipeline.updated_at),
+      confidence: 68,
+      title: `${pipeline.ref || "Pipeline"} failed`,
+      reason: job.failure_reason || job.status || pipeline.status,
+      status: pipeline.status,
+      runner: job.runner?.description || job.stage || "GitLab runner",
+      source: "gitlab"
+    };
+  }));
+
+  return hydrated;
+}
+
+async function findMergeRequestForBranch(branch) {
+  const mergeRequests = await gitlabFetch(projectPath("/merge_requests"), {
+    state: "opened",
+    source_branch: branch,
+    per_page: "1"
+  }).catch(() => []);
+
+  return mergeRequests[0] || null;
+}
+
+async function readRepositoryFile(pathname, ref) {
+  const encodedPath = encodeURIComponent(pathname);
+  return gitlabFetch(projectPath(`/repository/files/${encodedPath}/raw`), { ref })
+    .catch((error) => `Unable to read ${pathname}: ${error.message}`);
+}
+
+async function buildGitLabInvestigation(pipelineId) {
+  const pipeline = await gitlabFetch(projectPath(`/pipelines/${pipelineId}`));
+  const failedJobs = await gitlabFetch(projectPath(`/pipelines/${pipelineId}/jobs`), {
+    "scope[]": "failed",
+    per_page: "20"
+  });
+  const job = failedJobs[0];
+
+  if (!job) {
+    throw new Error(`Pipeline #${pipelineId} has no failed jobs available.`);
+  }
+
+  const trace = await gitlabFetch(projectPath(`/jobs/${job.id}/trace`));
+  const traceFiles = extractFilePaths(trace);
+  const mergeRequest = await findMergeRequestForBranch(pipeline.ref);
+  const changedFiles = mergeRequest
+    ? await gitlabFetch(projectPath(`/merge_requests/${mergeRequest.iid}/changes`))
+      .then((payload) => payload.changes?.map((change) => change.new_path).slice(0, 6) || [])
+      .catch(() => [])
+    : [];
+  const candidateFiles = [...new Set([...traceFiles, ...changedFiles])].slice(0, 6);
+  const files = await Promise.all(candidateFiles.map(async (filePath) => {
+    const content = await readRepositoryFile(filePath, pipeline.sha || pipeline.ref);
+    return {
+      path: filePath,
+      note: content.startsWith("Unable to read")
+        ? content
+        : `Fetched ${Math.min(content.length, 20000)} chars from GitLab for evidence review.`,
+      preview: content.slice(0, 2000)
+    };
+  }));
+
+  const branch = `devops-medic/patch-pipeline-${pipeline.id}`;
+  const signal = extractTraceSignal(trace);
+  const investigation = {
+    id: crypto.randomUUID(),
+    pipelineId: String(pipeline.id),
+    state: "evidence_collected",
+    confidence: files.length ? 72 : 58,
+    steps: steps.map((step) => ({ ...step, status: step.id === "draft_patch" ? "blocked" : "complete" })),
+    evidence: {
+      trace,
+      files: files.length ? files : [{
+        path: "No source files detected",
+        note: "The failed trace did not expose a repository file path. Inspect the raw log and MR diff manually."
+      }]
+    },
+    patch: {
+      state: "needs_ai_patch_generation",
+      diff: [
+        "Real GitLab evidence has been collected.",
+        "",
+        "Patch generation is intentionally blocked until Gemini or another code model is configured.",
+        "Next integration point: send trace, MR diff, and fetched files to the model, then validate in a sandbox."
+      ].join("\n"),
+      branch
+    },
+    mergeRequest: {
+      state: "not_created",
+      title: `DevOps Medic: recover pipeline #${pipeline.id}`,
+      branch,
+      targetBranch: pipeline.ref,
+      sourceMergeRequest: mergeRequest ? `!${mergeRequest.iid}` : "not found",
+      description: {
+        broke: `${job.name} failed with: ${signal}`,
+        why: "Root cause requires model-assisted analysis of the collected trace and file context.",
+        fixed: "No repository mutation has been made. This run is read-only evidence collection.",
+        validation: `After patch generation, re-run ${job.name} for ${pipeline.ref}.`
+      }
+    },
+    controls: {
+      protectedBranchPush: false,
+      humanApprovalRequired: true,
+      maxFilesChanged: 3,
+      maxPatchBytes: 12000
+    },
+    gitlab: {
+      projectId: GITLAB_PROJECT_ID,
+      pipelineUrl: pipeline.web_url,
+      jobUrl: job.web_url,
+      mergeRequestUrl: mergeRequest?.web_url || ""
+    },
+    createdAt: new Date().toISOString()
+  };
+
+  investigations.set(investigation.id, investigation);
+  audit("gitlab.investigation.run", {
+    pipelineId: pipeline.id,
+    jobId: job.id,
+    job: job.name,
+    branch: pipeline.ref,
+    files: files.map((file) => file.path)
+  });
+
+  return investigation;
+}
+
+function writeJson(res, statusCode, payload) {
+  const body = JSON.stringify(payload, null, 2);
+  res.writeHead(statusCode, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Cache-Control": "no-store"
+  });
+  res.end(body);
+}
+
+function readJson(req) {
+  return new Promise((resolve, reject) => {
+    let body = "";
+    req.on("data", (chunk) => {
+      body += chunk;
+      if (body.length > 1_000_000) {
+        req.destroy();
+        reject(new Error("Payload too large"));
+      }
+    });
+    req.on("end", () => {
+      if (!body) {
+        resolve({});
+        return;
+      }
+      try {
+        resolve(JSON.parse(body));
+      } catch (error) {
+        reject(error);
+      }
+    });
+  });
+}
+
+function audit(action, details) {
+  const entry = {
+    id: crypto.randomUUID(),
+    action,
+    details,
+    at: new Date().toISOString()
+  };
+  auditLog.unshift(entry);
+  auditLog.splice(100);
+  return entry;
+}
+
+function publicPipeline(pipeline) {
+  return {
+    id: pipeline.id,
+    displayId: `#${pipeline.id}`,
+    job: pipeline.job,
+    branch: pipeline.branch,
+    mr: pipeline.mr,
+    failedAgo: pipeline.failedAgo,
+    title: pipeline.title,
+    reason: pipeline.reason,
+    status: pipeline.status,
+    runner: pipeline.runner
+  };
+}
+
+function buildInvestigation(pipeline) {
+  const branch = `devops-medic/patch-pipeline-${pipeline.id}`;
+  return {
+    id: crypto.randomUUID(),
+    pipelineId: pipeline.id,
+    state: "ready_for_review",
+    confidence: pipeline.confidence,
+    steps: steps.map((step) => ({ ...step, status: "complete" })),
+    evidence: {
+      trace: pipeline.trace,
+      files: pipeline.files
+    },
+    patch: {
+      state: "drafted",
+      diff: pipeline.patch,
+      branch
+    },
+    mergeRequest: {
+      state: "requires_human_approval",
+      title: `DevOps Medic: recover pipeline #${pipeline.id}`,
+      branch,
+      targetBranch: pipeline.branch,
+      description: {
+        broke: pipeline.mr.broke,
+        why: pipeline.mr.why,
+        fixed: pipeline.mr.fixed,
+        validation: `Re-run ${pipeline.job} for ${pipeline.branch} before merge.`
+      }
+    },
+    controls: {
+      protectedBranchPush: false,
+      humanApprovalRequired: true,
+      maxFilesChanged: 3,
+      maxPatchBytes: 12000
+    },
+    createdAt: new Date().toISOString()
+  };
+}
+
+function verifyWebhook(req) {
+  if (!WEBHOOK_TOKEN) return true;
+  const provided = req.headers["x-gitlab-token"] || "";
+  const providedBuffer = Buffer.from(provided);
+  const expectedBuffer = Buffer.from(WEBHOOK_TOKEN);
+  if (providedBuffer.length !== expectedBuffer.length) return false;
+  return crypto.timingSafeEqual(providedBuffer, expectedBuffer);
+}
+
+function routeStatic(req, res) {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const requestedPath = url.pathname === "/" ? "/index.html" : url.pathname;
+  const filePath = path.normalize(path.join(ROOT, requestedPath));
+
+  if (!filePath.startsWith(ROOT)) {
+    res.writeHead(403);
+    res.end("Forbidden");
+    return;
+  }
+
+  const allowed = new Map([
+    [".html", "text/html; charset=utf-8"],
+    [".css", "text/css; charset=utf-8"],
+    [".js", "text/javascript; charset=utf-8"],
+    [".json", "application/json; charset=utf-8"]
+  ]);
+  const type = allowed.get(path.extname(filePath));
+
+  if (!type) {
+    res.writeHead(404);
+    res.end("Not found");
+    return;
+  }
+
+  fs.readFile(filePath, (error, data) => {
+    if (error) {
+      res.writeHead(404);
+      res.end("Not found");
+      return;
+    }
+    res.writeHead(200, { "Content-Type": type });
+    res.end(data);
+  });
+}
+
+async function routeApi(req, res) {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+
+  if (req.method === "GET" && url.pathname === "/api/health") {
+    writeJson(res, 200, {
+      ok: true,
+      mode: USE_GITLAB ? "gitlab-live-readonly" : "mock-gitlab-mcp",
+      webhookVerification: WEBHOOK_TOKEN ? "enabled" : "disabled",
+      gitlab: {
+        configured: USE_GITLAB,
+        baseUrl: GITLAB_BASE_URL,
+        projectId: GITLAB_PROJECT_ID || "not configured",
+        mutationMode: "read-only until approval workflow is implemented"
+      }
+    });
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/pipelines") {
+    if (USE_GITLAB) {
+      const livePipelines = await listFailedPipelinesFromGitLab();
+      writeJson(res, 200, {
+        source: "gitlab",
+        pipelines: livePipelines.map(publicPipeline),
+        failedCount: livePipelines.length
+      });
+      return;
+    }
+
+    writeJson(res, 200, {
+      source: "mock",
+      pipelines: pipelines.map(publicPipeline),
+      failedCount: pipelines.length
+    });
+    return;
+  }
+
+  const runMatch = url.pathname.match(/^\/api\/investigations\/([^/]+)\/run$/);
+  if (req.method === "POST" && runMatch) {
+    if (USE_GITLAB) {
+      const investigation = await buildGitLabInvestigation(runMatch[1]);
+      writeJson(res, 201, { investigation });
+      return;
+    }
+
+    const pipeline = pipelines.find((item) => item.id === runMatch[1]);
+    if (!pipeline) {
+      writeJson(res, 404, { error: "Pipeline not found" });
+      return;
+    }
+    const investigation = buildInvestigation(pipeline);
+    investigations.set(investigation.id, investigation);
+    audit("investigation.run", {
+      pipelineId: pipeline.id,
+      job: pipeline.job,
+      branch: pipeline.branch,
+      files: pipeline.files.map((file) => file.path)
+    });
+    writeJson(res, 201, { investigation });
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/investigations") {
+    writeJson(res, 200, { investigations: [...investigations.values()] });
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/audit") {
+    writeJson(res, 200, { events: auditLog });
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/webhooks/gitlab") {
+    if (!verifyWebhook(req)) {
+      audit("webhook.rejected", { reason: "token_mismatch" });
+      writeJson(res, 401, { error: "Invalid GitLab webhook token" });
+      return;
+    }
+
+    const payload = await readJson(req);
+    audit("webhook.accepted", {
+      objectKind: payload.object_kind || payload.objectKind || "unknown",
+      project: payload.project?.path_with_namespace || payload.project?.name || "unknown",
+      pipelineId: payload.object_attributes?.id || payload.pipeline_id || "unknown"
+    });
+    writeJson(res, 202, { accepted: true });
+    return;
+  }
+
+  writeJson(res, 404, { error: "Not found" });
+}
+
+const server = http.createServer((req, res) => {
+  if (!req.url.startsWith("/api/") && !req.url.startsWith("/webhooks/")) {
+    routeStatic(req, res);
+    return;
+  }
+
+  routeApi(req, res).catch((error) => {
+    audit("server.error", { message: error.message });
+    writeJson(res, 400, { error: error.message });
+  });
+});
+
+server.listen(PORT, () => {
+  console.log(`DevOps Medic listening on http://localhost:${PORT}`);
+});

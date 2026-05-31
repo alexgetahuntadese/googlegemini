@@ -201,6 +201,7 @@ dd {
 }
 
 .topbar-actions {
+  position: relative;
   display: flex;
   flex-wrap: wrap;
   gap: 10px;
@@ -209,7 +210,8 @@ dd {
 
 .primary-button,
 .secondary-button,
-.icon-button {
+.icon-button,
+.menu-button {
   min-height: 40px;
   border-radius: 8px;
   border: 1px solid var(--line);
@@ -232,6 +234,57 @@ dd {
   background: var(--accent-strong);
 }
 
+.menu-group {
+  position: relative;
+}
+
+.menu-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.menu-button span {
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.dropdown-menu {
+  position: absolute;
+  z-index: 10;
+  top: calc(100% + 8px);
+  right: 0;
+  display: none;
+  width: 210px;
+  padding: 6px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.dropdown-menu.open {
+  display: grid;
+  gap: 4px;
+}
+
+.dropdown-menu button {
+  min-height: 36px;
+  width: 100%;
+  border: 0;
+  border-radius: 6px;
+  padding: 0 10px;
+  background: transparent;
+  color: var(--ink);
+  text-align: left;
+}
+
+.dropdown-menu button:hover,
+.dropdown-menu button:focus-visible {
+  outline: 0;
+  background: var(--surface-muted);
+}
+
 .secondary-button.compact {
   min-height: 34px;
   font-size: 0.88rem;
@@ -252,7 +305,7 @@ dd {
 
 .status-strip {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 12px;
   margin-bottom: 16px;
 }
@@ -476,6 +529,30 @@ pre {
   margin: 0 0 14px;
 }
 
+.control-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px 14px;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 0.88rem;
+}
+
+.control-grid strong {
+  color: var(--ink);
+}
+
+.control-grid a {
+  color: var(--accent-strong);
+  text-decoration: none;
+}
+
+.control-grid a:hover {
+  text-decoration: underline;
+}
+
 @media (max-width: 1120px) {
   .app-shell {
     grid-template-columns: 1fr;
@@ -519,6 +596,10 @@ pre {
 
   .status-strip,
   .workspace-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .workspace-grid {
     grid-template-columns: 1fr;
   }
 }
@@ -540,6 +621,10 @@ pre {
   .status-strip article {
     grid-template-columns: 88px minmax(0, 1fr);
     align-items: center;
+  }
+
+  .status-strip {
+    grid-template-columns: 1fr;
   }
 
   .status-strip small {
