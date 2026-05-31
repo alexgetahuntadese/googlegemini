@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Auto CI/CD DevOps Medic</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="Workspace">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">CI</div>
+          <div>
+            <h1>DevOps Medic</h1>
+            <p>GitLab pipeline recovery</p>
+          </div>
+        </div>
+
+        <nav class="nav-list" aria-label="Primary">
+          <button class="nav-item active" type="button" data-view="triage">
+            <span class="nav-icon" aria-hidden="true"></span>
+            Triage
+          </button>
+          <button class="nav-item" type="button" data-view="patch">
+            <span class="nav-icon square" aria-hidden="true"></span>
+            Patch
+          </button>
+          <button class="nav-item" type="button" data-view="merge-request">
+            <span class="nav-icon diamond" aria-hidden="true"></span>
+            Merge Request
+          </button>
+        </nav>
+
+        <section class="connection-panel" aria-labelledby="connection-title">
+          <h2 id="connection-title">MCP Connection</h2>
+          <dl>
+            <div>
+              <dt>Server</dt>
+              <dd>GitLab MCP</dd>
+            </div>
+            <div>
+              <dt>Tools</dt>
+              <dd>pipelines, search, merge requests</dd>
+            </div>
+            <div>
+              <dt>Mutation mode</dt>
+              <dd>Hotfix branch only</dd>
+            </div>
+          </dl>
+        </section>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">Autonomous recovery loop</p>
+            <h2>Failed pipeline investigation</h2>
+          </div>
+          <div class="topbar-actions">
+            <button class="secondary-button" id="resetDemo" type="button">Reset</button>
+            <button class="primary-button" id="runMedic" type="button">
+              <span class="button-dot" aria-hidden="true"></span>
+              Run medic
+            </button>
+          </div>
+        </header>
+
+        <section class="status-strip" aria-label="Pipeline status summary">
+          <article>
+            <span class="status-label">Pipeline</span>
+            <strong id="pipelineId">#12841</strong>
+            <small>failed 7 min ago</small>
+          </article>
+          <article>
+            <span class="status-label">Job</span>
+            <strong id="jobName">unit:test</strong>
+            <small>Node 20 runner</small>
+          </article>
+          <article>
+            <span class="status-label">Branch</span>
+            <strong id="branchName">feature/cache-layer</strong>
+            <small>MR !482</small>
+          </article>
+          <article>
+            <span class="status-label">Confidence</span>
+            <strong id="confidenceValue">0%</strong>
+            <small>waiting for logs</small>
+          </article>
+        </section>
+
+        <div class="workspace-grid">
+          <section class="panel pipeline-panel" aria-labelledby="pipeline-title">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">Queue</p>
+                <h3 id="pipeline-title">Recent failures</h3>
+              </div>
+              <span class="pill danger">3 failed</span>
+            </div>
+            <div class="pipeline-list" id="pipelineList"></div>
+          </section>
+
+          <section class="panel stream-panel" aria-labelledby="stream-title">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">Agent stream</p>
+                <h3 id="stream-title">Evidence trail</h3>
+              </div>
+              <span class="pill" id="agentState">idle</span>
+            </div>
+            <ol class="timeline" id="timeline" aria-live="polite"></ol>
+          </section>
+
+          <section class="panel log-panel" aria-labelledby="log-title">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">Trace</p>
+                <h3 id="log-title">Failed job log</h3>
+              </div>
+              <button class="icon-button" id="copyTrace" type="button" aria-label="Copy trace">Copy</button>
+            </div>
+            <pre id="traceOutput"></pre>
+          </section>
+
+          <section class="panel context-panel" aria-labelledby="context-title">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">Code context</p>
+                <h3 id="context-title">Files under review</h3>
+              </div>
+              <span class="pill warning" id="filesTouched">0 files</span>
+            </div>
+            <div class="file-stack" id="fileStack"></div>
+          </section>
+
+          <section class="panel patch-panel" aria-labelledby="patch-title">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">Patch plan</p>
+                <h3 id="patch-title">Generated fix</h3>
+              </div>
+              <span class="pill success" id="patchState">not drafted</span>
+            </div>
+            <pre id="patchOutput"></pre>
+          </section>
+
+          <section class="panel mr-panel" aria-labelledby="mr-title">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">Human gate</p>
+                <h3 id="mr-title">Merge request draft</h3>
+              </div>
+              <button class="secondary-button compact" id="openMr" type="button" disabled>Open MR</button>
+            </div>
+            <div class="mr-copy" id="mrCopy">
+              Select a failed pipeline and run the medic to generate a merge request summary.
+            </div>
+          </section>
+        </div>
+      </main>
+    </div>
+
+    <script src="app.js"></script>
+  </body>
+</html>
