@@ -2,12 +2,15 @@
   "name": "devops-medic",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "description": "Auto CI/CD DevOps Medic prototype with a production-shaped backend boundary.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "check": "node --check server.js && node --check app.js && node --check scripts/smoke-test.js",
-    "smoke": "node scripts/smoke-test.js"
+    "smoke": "node scripts/smoke-test.js",
+    "verify": "npm run check && npm run smoke",
+    "build:win32": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -ExecutionPolicy Bypass -File scripts/build-win32.ps1"
   },
   "engines": {
     "node": ">=20"

@@ -54,10 +54,22 @@ async function assertOk(pathname, expectedContentType) {
   return response;
 }
 
+async function assertStatus(pathname, expectedStatus) {
+  const response = await fetch(`${baseUrl}${pathname}`);
+  if (response.status !== expectedStatus) {
+    throw new Error(`${pathname} returned ${response.status}; expected ${expectedStatus}`);
+  }
+  return response;
+}
+
 async function main() {
   await waitForServer();
 
-  const health = await assertOk("/api/health", "application/json").then((res) => res.json());
+  const healthResponse = await assertOk("/api/health", "application/json");
+  if (healthResponse.headers.get("x-content-type-options") !== "nosniff") {
+    throw new Error("Expected security headers on API responses.");
+  }
+  const health = await healthResponse.json();
   if (!health.ok || health.mode !== "mock-gitlab-mcp") {
     throw new Error(`Unexpected health payload: ${JSON.stringify(health)}`);
   }
@@ -76,6 +88,10 @@ async function main() {
   if (!page.includes("DevOps Medic")) {
     throw new Error("Expected index page to render app shell.");
   }
+
+  await assertStatus("/server.js", 404);
+  await assertStatus("/package.json", 404);
+  await assertStatus("/scripts/smoke-test.js", 404);
 
   finished = true;
   server.kill("SIGTERM");

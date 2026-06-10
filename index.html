@@ -13,7 +13,7 @@
           <div class="brand-mark" aria-hidden="true">CI</div>
           <div>
             <h1>DevOps Medic</h1>
-            <p>GitLab pipeline recovery</p>
+            <p>Autonomous pipeline recovery</p>
           </div>
         </div>
 
@@ -33,19 +33,19 @@
         </nav>
 
         <section class="connection-panel" aria-labelledby="connection-title">
-          <h2 id="connection-title">MCP Connection</h2>
+          <h2 id="connection-title">Agent Stack</h2>
           <dl>
             <div>
-              <dt>Server</dt>
-              <dd>GitLab MCP</dd>
+              <dt>Partner track</dt>
+              <dd>GitLab MCP tools</dd>
             </div>
             <div>
-              <dt>Tools</dt>
-              <dd>pipelines, search, merge requests</dd>
+              <dt>Reasoning</dt>
+              <dd>Gemini patch drafting</dd>
             </div>
             <div>
               <dt>Mutation mode</dt>
-              <dd>Hotfix branch only</dd>
+              <dd>Read-only until approval</dd>
             </div>
           </dl>
         </section>
@@ -103,7 +103,7 @@
           <div class="setup-copy">
             <p class="eyebrow">Repository setup</p>
             <h3 id="setup-title">Connect a GitLab project</h3>
-            <p>Use a project ID or namespace path. The token stays in this server session and is not written to disk.</p>
+            <p>Use a project ID or namespace path. Add a Gemini key in the server environment to turn evidence into a model-drafted patch.</p>
           </div>
           <form class="setup-form" id="setupForm">
             <label>
@@ -134,17 +134,17 @@
           <article>
             <span class="status-label">Pipeline</span>
             <strong id="pipelineId">#12841</strong>
-            <small>failed 7 min ago</small>
+            <small id="pipelineMeta">failed 7 min ago</small>
           </article>
           <article>
             <span class="status-label">Job</span>
             <strong id="jobName">unit:test</strong>
-            <small>Node 20 runner</small>
+            <small id="jobRunner">Node 20 runner</small>
           </article>
           <article>
             <span class="status-label">Branch</span>
             <strong id="branchName">feature/cache-layer</strong>
-            <small>MR !482</small>
+            <small id="branchMeta">MR !482</small>
           </article>
           <article>
             <span class="status-label">Confidence</span>
@@ -165,7 +165,7 @@
                 <p class="eyebrow">Queue</p>
                 <h3 id="pipeline-title">Recent failures</h3>
               </div>
-              <span class="pill danger">3 failed</span>
+              <span class="pill danger" id="pipelineCount">3 failed</span>
             </div>
             <div class="pipeline-list" id="pipelineList"></div>
           </section>
@@ -220,7 +220,7 @@
                 <p class="eyebrow">Human gate</p>
                 <h3 id="mr-title">Merge request draft</h3>
               </div>
-              <button class="secondary-button compact" id="openMr" type="button" disabled>Open MR</button>
+              <button class="secondary-button compact" id="openMr" type="button" disabled>Queue MR</button>
             </div>
             <div class="mr-copy" id="mrCopy">
               Select a failed pipeline and run the medic to generate a merge request summary.

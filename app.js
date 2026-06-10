@@ -25,13 +25,17 @@ const state = {
   pipelines: [],
   selected: null,
   running: false,
-  latestInvestigation: null
+  latestInvestigation: null,
+  setup: null
 };
 
 const pipelineList = document.querySelector("#pipelineList");
 const pipelineId = document.querySelector("#pipelineId");
+const pipelineMeta = document.querySelector("#pipelineMeta");
 const jobName = document.querySelector("#jobName");
+const jobRunner = document.querySelector("#jobRunner");
 const branchName = document.querySelector("#branchName");
+const branchMeta = document.querySelector("#branchMeta");
 const confidenceValue = document.querySelector("#confidenceValue");
 const timeline = document.querySelector("#timeline");
 const traceOutput = document.querySelector("#traceOutput");
@@ -45,6 +49,7 @@ const runMedic = document.querySelector("#runMedic");
 const resetDemo = document.querySelector("#resetDemo");
 const openMr = document.querySelector("#openMr");
 const copyTrace = document.querySelector("#copyTrace");
+const pipelineCount = document.querySelector("#pipelineCount");
 const projectValue = document.querySelector("#projectValue");
 const modeValue = document.querySelector("#modeValue");
 const setupForm = document.querySelector("#setupForm");
@@ -55,6 +60,7 @@ const setupWebhookToken = document.querySelector("#setupWebhookToken");
 const setupStatus = document.querySelector("#setupStatus");
 const saveSetup = document.querySelector("#saveSetup");
 const useMock = document.querySelector("#useMock");
+const setupInputs = [setupBaseUrl, setupProjectId, setupToken, setupWebhookToken];
 
 async function api(path, options = {}) {
   const response = await fetch(path, {
@@ -90,10 +96,23 @@ function setSetupStatus(label, className = "") {
 }
 
 function renderSetup(setup) {
+  state.setup = setup;
+  const runtimeSetupAllowed = setup.runtimeSetupAllowed !== false;
   setupBaseUrl.value = setup.baseUrl || "https://gitlab.com";
   setupProjectId.value = setup.projectId || "";
   setupToken.placeholder = setup.tokenConfigured ? "configured for this session" : "glpat-...";
   setupWebhookToken.placeholder = setup.webhookTokenConfigured ? "configured for this session" : "optional";
+  setupInputs.forEach((input) => {
+    input.disabled = !runtimeSetupAllowed;
+  });
+  saveSetup.disabled = !runtimeSetupAllowed;
+  useMock.disabled = !runtimeSetupAllowed;
+
+  if (!runtimeSetupAllowed) {
+    setSetupStatus(setup.configured ? "env connected" : "env setup only", setup.configured ? "success" : "warning");
+    return;
+  }
+
   setSetupStatus(setup.configured ? "connected" : "mock mode", setup.configured ? "success" : "");
 }
 
@@ -130,8 +149,11 @@ function renderPipelines() {
 function renderSelected() {
   if (!state.selected) {
     pipelineId.textContent = "-";
+    pipelineMeta.textContent = "waiting";
     jobName.textContent = "-";
+    jobRunner.textContent = "no runner";
     branchName.textContent = "-";
+    branchMeta.textContent = "no branch";
     confidenceValue.textContent = "0%";
     traceOutput.textContent = "No pipeline loaded.";
     return;
@@ -139,15 +161,19 @@ function renderSelected() {
 
   const pipeline = state.selected;
   pipelineId.textContent = pipeline.displayId;
+  pipelineMeta.textContent = `${pipeline.status || "failed"} ${pipeline.failedAgo || "recently"}`;
   jobName.textContent = pipeline.job;
+  jobRunner.textContent = pipeline.runner || "Runner unavailable";
   branchName.textContent = pipeline.branch;
+  branchMeta.textContent = pipeline.mr ? `MR ${pipeline.mr}` : "No MR linked";
   confidenceValue.textContent = "0%";
   traceOutput.textContent = "Raw trace will appear after the backend reads job logs.";
-  fileStack.innerHTML = `<div class="file-card"><strong>Waiting for MCP search</strong><p>Source context appears here after stack trace mapping.</p></div>`;
+  fileStack.innerHTML = `<div class="file-card"><strong>Waiting for repository scan</strong><p>Source context appears here after stack trace mapping.</p></div>`;
   filesTouched.textContent = "0 files";
   patchOutput.textContent = "No patch drafted yet.";
   patchState.textContent = "not drafted";
   mrCopy.textContent = "Run the medic to generate a merge request summary with approval controls.";
+  openMr.textContent = "Queue MR";
   openMr.disabled = true;
 }
 
@@ -285,6 +311,8 @@ async function loadPipelines() {
     state.pipelines = payload.pipelines;
     state.selected = state.pipelines[0] || null;
     renderSetup(setupPayload.setup);
+    pipelineCount.textContent = `${payload.failedCount} failed`;
+    pipelineCount.className = `pill${payload.failedCount ? " danger" : " success"}`;
     setAgentState(health.mode, health.gitlab?.configured ? "success" : "");
     projectValue.textContent = health.gitlab?.configured ? `GitLab ${health.gitlab.projectId}` : "Mock project";
     modeValue.textContent = health.gitlab?.configured ? "Live read-only" : "MR ready";
@@ -297,6 +325,8 @@ async function loadPipelines() {
     }
   } catch (error) {
     setAgentState("backend offline", "danger");
+    pipelineCount.textContent = "offline";
+    pipelineCount.className = "pill danger";
     pipelineList.innerHTML = `<div class="file-card"><strong>Backend unavailable</strong><p>${escapeHtml(error.message)}</p></div>`;
     traceOutput.textContent = "Start the backend with: node server.js";
     runMedic.disabled = true;
@@ -305,6 +335,12 @@ async function loadPipelines() {
 
 async function saveRepositorySetup(event) {
   event.preventDefault();
+
+  if (state.setup?.runtimeSetupAllowed === false) {
+    setSetupStatus("env setup only", "warning");
+    return;
+  }
+
   saveSetup.disabled = true;
   useMock.disabled = true;
   setSetupStatus("connecting", "warning");
@@ -330,8 +366,9 @@ async function saveRepositorySetup(event) {
     setAgentState("setup failed", "danger");
     traceOutput.textContent = error.message;
   } finally {
-    saveSetup.disabled = false;
-    useMock.disabled = false;
+    const runtimeSetupAllowed = state.setup?.runtimeSetupAllowed !== false;
+    saveSetup.disabled = !runtimeSetupAllowed;
+    useMock.disabled = !runtimeSetupAllowed;
   }
 }
 
@@ -376,7 +413,7 @@ openMr.addEventListener("click", () => {
   openMr.textContent = "Approval queued";
   setAgentState("awaiting approval", "warning");
   window.setTimeout(() => {
-    openMr.textContent = "Open MR";
+    openMr.textContent = "Queue MR";
   }, 1000);
 });
 
@@ -384,6 +421,12 @@ document.querySelectorAll(".nav-item").forEach((button) => {
   button.addEventListener("click", () => {
     document.querySelectorAll(".nav-item").forEach((item) => item.classList.remove("active"));
     button.classList.add("active");
+    const target = {
+      triage: ".pipeline-panel",
+      patch: ".patch-panel",
+      "merge-request": ".mr-panel"
+    }[button.dataset.view];
+    if (target) document.querySelector(target)?.scrollIntoView({ behavior: "smooth", block: "start" });
   });
 });
 

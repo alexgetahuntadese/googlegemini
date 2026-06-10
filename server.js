@@ -8,11 +8,14 @@ loadEnvFile(path.join(__dirname, ".env"));
 const NODE_ENV = process.env.NODE_ENV || "development";
 const IS_PRODUCTION = NODE_ENV === "production";
 const PORT = parsePort(process.env.PORT, 4173);
+const ALLOW_RUNTIME_SETUP = parseBoolean(process.env.ALLOW_RUNTIME_SETUP, !IS_PRODUCTION);
 const runtimeConfig = {
   webhookToken: process.env.GITLAB_WEBHOOK_TOKEN || "",
   gitlabBaseUrl: normalizeGitLabBaseUrl(process.env.GITLAB_BASE_URL || "https://gitlab.com"),
   gitlabToken: process.env.GITLAB_TOKEN || "",
   gitlabProjectId: process.env.GITLAB_PROJECT_ID || "",
+  geminiApiKey: process.env.GEMINI_API_KEY || "",
+  geminiModel: process.env.GEMINI_MODEL || "gemini-3-pro",
   source: process.env.GITLAB_TOKEN && process.env.GITLAB_PROJECT_ID ? "env" : "mock"
 };
 const API_RATE_LIMIT_PER_MINUTE = parsePositiveInt(process.env.API_RATE_LIMIT_PER_MINUTE, 120);
@@ -21,6 +24,12 @@ const REQUEST_TIMEOUT_MS = parsePositiveInt(process.env.REQUEST_TIMEOUT_MS, 30_0
 const SHUTDOWN_GRACE_MS = parsePositiveInt(process.env.SHUTDOWN_GRACE_MS, 10_000);
 const ROOT = __dirname;
 const STATIC_CACHE_SECONDS = IS_PRODUCTION ? 3600 : 0;
+const STATIC_ASSETS = new Map([
+  ["/", { file: "index.html", type: "text/html; charset=utf-8", html: true }],
+  ["/index.html", { file: "index.html", type: "text/html; charset=utf-8", html: true }],
+  ["/styles.css", { file: "styles.css", type: "text/css; charset=utf-8" }],
+  ["/app.js", { file: "app.js", type: "text/javascript; charset=utf-8" }]
+]);
 const rateLimitBuckets = new Map();
 
 validateConfig();
@@ -56,6 +65,11 @@ function parsePositiveInt(value, fallback) {
   return parsed;
 }
 
+function parseBoolean(value, fallback) {
+  if (value === undefined || value === "") return fallback;
+  return ["1", "true", "yes", "on"].includes(String(value).toLowerCase());
+}
+
 function normalizeGitLabBaseUrl(value) {
   const baseUrl = String(value || "https://gitlab.com").trim().replace(/\/+$/, "");
   const parsed = new URL(baseUrl);
@@ -76,13 +90,25 @@ function publicSetup() {
     baseUrl: runtimeConfig.gitlabBaseUrl,
     projectId: runtimeConfig.gitlabProjectId || "",
     tokenConfigured: Boolean(runtimeConfig.gitlabToken),
-    webhookTokenConfigured: Boolean(runtimeConfig.webhookToken)
+    webhookTokenConfigured: Boolean(runtimeConfig.webhookToken),
+    geminiConfigured: Boolean(runtimeConfig.geminiApiKey),
+    geminiModel: runtimeConfig.geminiModel,
+    runtimeSetupAllowed: ALLOW_RUNTIME_SETUP
   };
+}
+
+function staticCacheControl(asset) {
+  if (asset.html) return "no-cache";
+  return STATIC_CACHE_SECONDS ? `public, max-age=${STATIC_CACHE_SECONDS}` : "no-cache";
 }
 
 function validateConfig() {
   if (IS_PRODUCTION && !runtimeConfig.webhookToken) {
     console.warn("Production warning: GITLAB_WEBHOOK_TOKEN is not set; webhook endpoint will reject requests.");
+  }
+
+  if (IS_PRODUCTION && ALLOW_RUNTIME_SETUP) {
+    console.warn("Production warning: ALLOW_RUNTIME_SETUP is enabled; protect this app behind authentication.");
   }
 
   if (IS_PRODUCTION && Boolean(runtimeConfig.gitlabToken) !== Boolean(runtimeConfig.gitlabProjectId)) {
@@ -386,6 +412,100 @@ async function readRepositoryFile(pathname, ref) {
     .catch((error) => `Unable to read ${pathname}: ${error.message}`);
 }
 
+function parseJsonFromModel(text) {
+  const trimmed = String(text || "").trim();
+  if (!trimmed) return null;
+
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
+    const candidate = fenced ? fenced[1] : trimmed.match(/\{[\s\S]*\}/)?.[0];
+    if (!candidate) return null;
+    try {
+      return JSON.parse(candidate);
+    } catch {
+      return null;
+    }
+  }
+}
+
+function buildGeminiPrompt({ pipeline, job, trace, files, mergeRequest }) {
+  const fileContext = files.map((file) => [
+    `FILE: ${file.path}`,
+    `NOTE: ${file.note}`,
+    "CONTENT:",
+    file.preview || ""
+  ].join("\n")).join("\n\n---\n\n");
+
+  return [
+    "You are DevOps Medic, a human-gated CI/CD recovery agent.",
+    "Use the GitLab pipeline trace and repository context to draft the smallest safe fix.",
+    "Return only JSON with this exact shape:",
+    "{\"summary\":\"one sentence\",\"rootCause\":\"one sentence\",\"diff\":\"unified diff or clear patch plan\",\"validation\":\"validation command or check\",\"confidence\":75}",
+    "",
+    "Safety policy:",
+    "- Do not propose credential, secret, deployment, or protected branch changes.",
+    "- Prefer a patch that changes at most 3 files and 12000 bytes.",
+    "- If the evidence is insufficient, set diff to an evidence-backed patch plan instead of inventing code.",
+    "",
+    `Pipeline: ${pipeline.id}`,
+    `Branch: ${pipeline.ref || "unknown"}`,
+    `Job: ${job.name}`,
+    `Failure reason: ${job.failure_reason || job.status || "failed"}`,
+    `Merge request: ${mergeRequest ? `!${mergeRequest.iid}` : "not found"}`,
+    "",
+    "TRACE:",
+    trace.slice(0, 16000),
+    "",
+    "REPOSITORY CONTEXT:",
+    fileContext.slice(0, 24000)
+  ].join("\n");
+}
+
+async function generateGeminiPatchProposal(context) {
+  if (!runtimeConfig.geminiApiKey) return null;
+
+  const url = new URL(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(runtimeConfig.geminiModel)}:generateContent`);
+  url.searchParams.set("key", runtimeConfig.geminiApiKey);
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "User-Agent": "devops-medic/0.1"
+    },
+    body: JSON.stringify({
+      contents: [{
+        role: "user",
+        parts: [{ text: buildGeminiPrompt(context) }]
+      }],
+      generationConfig: {
+        temperature: 0.2,
+        responseMimeType: "application/json"
+      }
+    })
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Gemini ${response.status}: ${text.slice(0, 240)}`);
+  }
+
+  const payload = await response.json();
+  const text = payload.candidates?.[0]?.content?.parts?.map((part) => part.text || "").join("\n") || "";
+  const parsed = parseJsonFromModel(text);
+  if (!parsed) throw new Error("Gemini returned a response that was not valid JSON.");
+
+  return {
+    summary: String(parsed.summary || "Gemini drafted a recovery proposal."),
+    rootCause: String(parsed.rootCause || "Root cause was inferred from pipeline evidence."),
+    diff: String(parsed.diff || "No patch diff returned."),
+    validation: String(parsed.validation || `Re-run ${context.job.name} for ${context.pipeline.ref}.`),
+    confidence: Math.max(1, Math.min(99, Number(parsed.confidence) || 75))
+  };
+}
+
 async function buildGitLabInvestigation(pipelineId) {
   const pipeline = await gitlabFetch(projectPath(`/pipelines/${pipelineId}`));
   const failedJobs = await gitlabFetch(projectPath(`/pipelines/${pipelineId}/jobs`), {
@@ -417,15 +537,21 @@ async function buildGitLabInvestigation(pipelineId) {
       preview: content.slice(0, 2000)
     };
   }));
+  const geminiProposal = await generateGeminiPatchProposal({ pipeline, job, trace, files, mergeRequest })
+    .catch((error) => {
+      audit("gemini.patch.failed", { pipelineId: pipeline.id, message: error.message });
+      return null;
+    });
 
   const branch = `devops-medic/patch-pipeline-${pipeline.id}`;
   const signal = extractTraceSignal(trace);
+  const modelGenerated = Boolean(geminiProposal);
   const investigation = {
     id: crypto.randomUUID(),
     pipelineId: String(pipeline.id),
-    state: "evidence_collected",
-    confidence: files.length ? 72 : 58,
-    steps: steps.map((step) => ({ ...step, status: step.id === "draft_patch" ? "blocked" : "complete" })),
+    state: modelGenerated ? "ready_for_review" : "evidence_collected",
+    confidence: modelGenerated ? geminiProposal.confidence : (files.length ? 72 : 58),
+    steps: steps.map((step) => ({ ...step, status: step.id === "draft_patch" && !modelGenerated ? "blocked" : "complete" })),
     evidence: {
       trace,
       files: files.length ? files : [{
@@ -434,26 +560,28 @@ async function buildGitLabInvestigation(pipelineId) {
       }]
     },
     patch: {
-      state: "needs_ai_patch_generation",
-      diff: [
-        "Real GitLab evidence has been collected.",
-        "",
-        "Patch generation is intentionally blocked until Gemini or another code model is configured.",
-        "Next integration point: send trace, MR diff, and fetched files to the model, then validate in a sandbox."
-      ].join("\n"),
+      state: modelGenerated ? "gemini_drafted" : "needs_gemini_patch_generation",
+      diff: modelGenerated
+        ? geminiProposal.diff
+        : [
+          "Real GitLab evidence has been collected.",
+          "",
+          "Patch generation is intentionally blocked until GEMINI_API_KEY is configured.",
+          "Next integration point: send trace, MR diff, and fetched files to Gemini, then validate in a sandbox."
+        ].join("\n"),
       branch
     },
     mergeRequest: {
-      state: "not_created",
+      state: modelGenerated ? "requires_human_approval" : "not_created",
       title: `DevOps Medic: recover pipeline #${pipeline.id}`,
       branch,
       targetBranch: pipeline.ref,
       sourceMergeRequest: mergeRequest ? `!${mergeRequest.iid}` : "not found",
       description: {
         broke: `${job.name} failed with: ${signal}`,
-        why: "Root cause requires model-assisted analysis of the collected trace and file context.",
-        fixed: "No repository mutation has been made. This run is read-only evidence collection.",
-        validation: `After patch generation, re-run ${job.name} for ${pipeline.ref}.`
+        why: modelGenerated ? geminiProposal.rootCause : "Root cause requires Gemini-assisted analysis of the collected trace and file context.",
+        fixed: modelGenerated ? geminiProposal.summary : "No repository mutation has been made. This run is read-only evidence collection.",
+        validation: modelGenerated ? geminiProposal.validation : `After patch generation, re-run ${job.name} for ${pipeline.ref}.`
       }
     },
     controls: {
@@ -468,6 +596,11 @@ async function buildGitLabInvestigation(pipelineId) {
       jobUrl: job.web_url,
       mergeRequestUrl: mergeRequest?.web_url || ""
     },
+    gemini: {
+      configured: Boolean(runtimeConfig.geminiApiKey),
+      model: runtimeConfig.geminiModel,
+      generatedPatch: modelGenerated
+    },
     createdAt: new Date().toISOString()
   };
 
@@ -477,7 +610,8 @@ async function buildGitLabInvestigation(pipelineId) {
     jobId: job.id,
     job: job.name,
     branch: pipeline.ref,
-    files: files.map((file) => file.path)
+    files: files.map((file) => file.path),
+    geminiGeneratedPatch: modelGenerated
   });
 
   return investigation;
@@ -520,6 +654,7 @@ function readJson(req) {
 function applyCommonHeaders(res) {
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
   res.setHeader("Referrer-Policy", "no-referrer");
   res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
   res.setHeader(
@@ -658,31 +793,15 @@ function routeStatic(req, res) {
     return;
   }
 
-  const filePath = path.resolve(ROOT, `.${requestedPath}`);
-  const relativePath = path.relative(ROOT, filePath);
-
-  if (relativePath.startsWith("..") || path.isAbsolute(relativePath)) {
-    applyCommonHeaders(res);
-    res.writeHead(403);
-    res.end("Forbidden");
-    return;
-  }
-
-  const allowed = new Map([
-    [".html", "text/html; charset=utf-8"],
-    [".css", "text/css; charset=utf-8"],
-    [".js", "text/javascript; charset=utf-8"],
-    [".json", "application/json; charset=utf-8"]
-  ]);
-  const type = allowed.get(path.extname(filePath));
-
-  if (!type) {
+  const asset = STATIC_ASSETS.get(requestedPath);
+  if (!asset) {
     applyCommonHeaders(res);
     res.writeHead(404);
     res.end("Not found");
     return;
   }
 
+  const filePath = path.join(ROOT, asset.file);
   fs.readFile(filePath, (error, data) => {
     if (error) {
       applyCommonHeaders(res);
@@ -692,10 +811,8 @@ function routeStatic(req, res) {
     }
     applyCommonHeaders(res);
     res.writeHead(200, {
-      "Content-Type": type,
-      "Cache-Control": STATIC_CACHE_SECONDS
-        ? `public, max-age=${STATIC_CACHE_SECONDS}`
-        : "no-cache"
+      "Content-Type": asset.type,
+      "Cache-Control": staticCacheControl(asset)
     });
     res.end(req.method === "HEAD" ? undefined : data);
   });
@@ -710,6 +827,13 @@ async function routeApi(req, res) {
   }
 
   if (req.method === "POST" && url.pathname === "/api/setup") {
+    if (!ALLOW_RUNTIME_SETUP) {
+      writeJson(res, 403, {
+        error: "Runtime repository setup is disabled. Configure GitLab with environment variables or set ALLOW_RUNTIME_SETUP=true."
+      });
+      return;
+    }
+
     const payload = await readJson(req);
     const baseUrl = normalizeGitLabBaseUrl(payload.baseUrl || "https://gitlab.com");
     const projectId = String(payload.projectId || "").trim();
@@ -744,13 +868,21 @@ async function routeApi(req, res) {
       ok: true,
       env: NODE_ENV,
       uptimeSeconds: Math.round(process.uptime()),
-      mode: isGitLabConfigured() ? "gitlab-live-readonly" : "mock-gitlab-mcp",
+      mode: isGitLabConfigured()
+        ? (runtimeConfig.geminiApiKey ? "gitlab-mcp-gemini" : "gitlab-live-readonly")
+        : "mock-gitlab-mcp",
       webhookVerification: runtimeConfig.webhookToken ? "enabled" : "disabled",
+      runtimeSetupAllowed: ALLOW_RUNTIME_SETUP,
       gitlab: {
         configured: isGitLabConfigured(),
         baseUrl: runtimeConfig.gitlabBaseUrl,
         projectId: runtimeConfig.gitlabProjectId || "not configured",
         mutationMode: "read-only until approval workflow is implemented"
+      },
+      gemini: {
+        configured: Boolean(runtimeConfig.geminiApiKey),
+        model: runtimeConfig.geminiModel,
+        role: "diagnosis and patch drafting"
       }
     });
     return;
